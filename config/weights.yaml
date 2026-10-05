@@ -1,0 +1,22 @@
+# Multi-Factor Risk Scoring Weights (Must sum to 1.0)
+weights:
+  severity: 0.25         # w1: Baseline rule severity (1-15 normalized to [0,1])
+  threat_intel: 0.35     # w2: CTI confidence subjected to temporal decay
+  asset_criticality: 0.25 # w3: Contextual host exposure/role multiplier
+  kill_chain: 0.15       # w4: Cumulative depth across MITRE ATT&CK tactics
+
+temporal_decay:
+  lambda_factor: 0.05    # Half-life decay constant (~14 days indicator relevance)
+  max_indicator_age_days: 90
+
+correlation:
+  time_window_seconds: 120   # Window for grouping related alert bursts
+  burst_threshold: 5         # Minimum alerts to trigger incident compression
+
+assets:
+  default_criticality: 1.0
+  tiers:
+    critical: 3.0   # e.g., Domain Controllers, Core DBs
+    high: 2.0       # e.g., Web servers, API gateways
+    medium: 1.5     # e.g., Internal endpoints, jumphosts
+    low: 1.0        # e.g., Staging / ephemeral test containers
