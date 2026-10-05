@@ -1,0 +1,150 @@
+"""
+Database schema and storage manager for Open-RBA.
+Stores normalized SIEM alerts in a local SQLite database for downstream
+heuristic correlation, threat enrichment, and risk scoring.
+"""
+
+import sqlite3
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, asdict
+
+
+@dataclass
+class NormalizedAlert:
+    """Standardized schema for normalized SIEM alerts across all sources."""
+    timestamp: str               # ISO 8601 string: YYYY-MM-DDTHH:MM:SS
+    rule_id: str                 # Wazuh rule ID (e.g., "5712", "100100")
+    rule_level: int              # Wazuh static rule level (1 to 15)
+    rule_description: str        # Human-readable description
+    agent_name: str              # Hostname / agent (e.g., "web01", "db01")
+    src_ip: Optional[str] = None # Attacker / source IP address
+    dst_ip: Optional[str] = None # Destination IP address
+    user: Optional[str] = None   # Target username (e.g., "root", "ubuntu")
+    process: Optional[str] = None# Process or executable name
+    mitre_tactics: Optional[List[str]] = None # List of MITRE IDs (e.g., ["T1110", "T1078"])
+    raw_payload: Optional[str] = None         # Original raw JSON for forensic auditing
+
+
+CREATE_ALERTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    rule_id TEXT NOT NULL,
+    rule_level INTEGER NOT NULL,
+    rule_description TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    src_ip TEXT,
+    dst_ip TEXT,
+    user TEXT,
+    process TEXT,
+    mitre_tactics TEXT, -- Stored as JSON array string
+    raw_payload TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts (timestamp);
+CREATE INDEX IF NOT EXISTS idx_alerts_src_ip ON alerts (src_ip);
+CREATE INDEX IF NOT EXISTS idx_alerts_rule_id ON alerts (rule_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_agent ON alerts (agent_name);
+"""
+
+
+class AlertDatabase:
+    """Manages SQLite operations for normalized alerts."""
+
+    def __init__(self, db_path: str = "data/alerts.db"):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.init_schema()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_schema(self) -> None:
+        """Initializes tables and indexing schema idempotently."""
+        with self._get_connection() as conn:
+            conn.executescript(CREATE_ALERTS_TABLE_SQL)
+
+    def insert_alert(self, alert: NormalizedAlert) -> int:
+        """Inserts a single normalized alert and returns the primary key ID."""
+        sql = """
+        INSERT INTO alerts (
+            timestamp, rule_id, rule_level, rule_description,
+            agent_name, src_ip, dst_ip, user, process,
+            mitre_tactics, raw_payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        mitre_json = json.dumps(alert.mitre_tactics) if alert.mitre_tactics else "[]"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, (
+                alert.timestamp,
+                alert.rule_id,
+                alert.rule_level,
+                alert.rule_description,
+                alert.agent_name,
+                alert.src_ip,
+                alert.dst_ip,
+                alert.user,
+                alert.process,
+                mitre_json,
+                alert.raw_payload
+            ))
+            return cursor.lastrowid
+
+    def insert_batch(self, alerts: List[NormalizedAlert]) -> int:
+        """Batch inserts a list of normalized alerts within a single transaction."""
+        if not alerts:
+            return 0
+        sql = """
+        INSERT INTO alerts (
+            timestamp, rule_id, rule_level, rule_description,
+            agent_name, src_ip, dst_ip, user, process,
+            mitre_tactics, raw_payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        rows = []
+        for a in alerts:
+            mitre_json = json.dumps(a.mitre_tactics) if a.mitre_tactics else "[]"
+            rows.append((
+                a.timestamp,
+                a.rule_id,
+                a.rule_level,
+                a.rule_description,
+                a.agent_name,
+                a.src_ip,
+                a.dst_ip,
+                a.user,
+                a.process,
+                mitre_json,
+                a.raw_payload
+            ))
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(sql, rows)
+            return cursor.rowcount
+
+    def fetch_recent(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Retrieves the most recent alerts ordered by timestamp descending."""
+        sql = "SELECT * FROM alerts ORDER BY timestamp DESC, id DESC LIMIT ?"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, (limit,))
+            results = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                d["mitre_tactics"] = json.loads(d["mitre_tactics"]) if d["mitre_tactics"] else []
+                results.append(d)
+            return results
+
+    def count(self) -> int:
+        """Returns total alert records currently stored."""
+        sql = "SELECT COUNT(*) FROM alerts"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            return cursor.fetchone()[0]
