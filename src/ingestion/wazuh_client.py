@@ -35,7 +35,7 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
         user = data_block.get("dstuser") or data_block.get("srcuser") or data_block.get("user")
         process = data_block.get("process") or raw.get("program_name")
 
-        # Extract MITRE ATT&CK tactic IDs
+        # Extract MITRE ATT&CK technique IDs
         mitre_tactics = []
         mitre_block = rule_block.get("mitre", {})
         if isinstance(mitre_block, dict):
@@ -73,7 +73,8 @@ class WazuhClient:
         self.db = AlertDatabase(db_path)
 
     def ingest_from_file(self, file_path: str, limit: Optional[int] = None) -> int:
-        """Reads a JSONL file (such as alerts.json) and inserts normalized rows."""
+        """Reads a JSONL file (such as alerts.json) and inserts normalized rows.
+        Duplicates are silently skipped via content_hash deduplication."""
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"Alerts file not found: {file_path}")
@@ -107,10 +108,11 @@ class WazuhClient:
     ) -> int:
         """
         Authenticates against Wazuh REST API (:55000), fetches JWT token,
-        and retrieves recent alerts.
+        and retrieves recent security alerts.
         """
         import urllib.request
         import ssl
+        import base64
 
         # Step 1: Authenticate and get JWT token
         auth_url = f"{api_url.rstrip('/')}/security/user/authenticate"
@@ -119,7 +121,6 @@ class WazuhClient:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
-        import base64
         cred_bytes = f"{user}:{password}".encode("utf-8")
         auth_header = f"Basic {base64.b64encode(cred_bytes).decode('utf-8')}"
 
@@ -136,8 +137,11 @@ class WazuhClient:
         except Exception as e:
             raise ConnectionError(f"Wazuh API authentication failed: {e}")
 
-        # Step 2: Fetch recent manager alerts
-        alerts_url = f"{api_url.rstrip('/')}/manager/logs?limit={limit}"
+        if not jwt_token:
+            raise ConnectionError("Wazuh API returned empty JWT token")
+
+        # Step 2: Fetch recent security alerts (not manager daemon logs)
+        alerts_url = f"{api_url.rstrip('/')}/alerts?limit={limit}&sort=-timestamp"
         req_alerts = urllib.request.Request(
             alerts_url,
             method="GET",
@@ -185,18 +189,18 @@ def main():
         count = client.ingest_from_file(args.file, limit=args.last)
 
     total_in_db = client.db.count()
-    print(f"✔ Successfully ingested {count} alert(s). Total in database: {total_in_db}")
+    print(f"✔ Ingested {count} new alert(s) ({total_in_db} total in database)")
 
-    print("\nRecent Normalized Alerts in Database:")
-    print("-" * 85)
-    print(f"{'TIMESTAMP':<24} {'RULE':<8} {'LVL':<4} {'HOST':<8} {'SRC IP':<15} {'MITRE':<12}")
-    print("-" * 85)
-    for a in client.db.fetch_recent(limit=min(5, args.last)):
+    print("\nRecent Normalized Alerts:")
+    print("-" * 90)
+    print(f"{'TIMESTAMP':<24} {'RULE':<8} {'LVL':<4} {'HOST':<8} {'SRC IP':<16} {'MITRE':<15}")
+    print("-" * 90)
+    for a in client.db.fetch_recent(limit=min(10, args.last)):
         ts = a["timestamp"][:19] if a["timestamp"] else "N/A"
-        mitre_str = ",".join(a["mitre_tactics"]) if a["mitre_tactics"] else "None"
-        src = a["src_ip"] or "N/A"
-        print(f"{ts:<24} {a['rule_id']:<8} {a['rule_level']:<4} {a['agent_name']:<8} {src:<15} {mitre_str:<12}")
-    print("-" * 85)
+        mitre_str = ",".join(a["mitre_tactics"]) if a["mitre_tactics"] else "—"
+        src = a["src_ip"] or "—"
+        print(f"{ts:<24} {a['rule_id']:<8} {a['rule_level']:<4} {a['agent_name']:<8} {src:<16} {mitre_str:<15}")
+    print("-" * 90)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,4 @@
+# Development and test dependencies for Open-RBA
+-r requirements.txt
+pytest>=8.0.0
+pytest-cov>=4.1.0

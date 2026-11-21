@@ -4,11 +4,12 @@ Stores normalized SIEM alerts in a local SQLite database for downstream
 heuristic correlation, threat enrichment, and risk scoring.
 """
 
+import hashlib
 import sqlite3
 import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 
 @dataclass
@@ -23,13 +24,24 @@ class NormalizedAlert:
     dst_ip: Optional[str] = None # Destination IP address
     user: Optional[str] = None   # Target username (e.g., "root", "ubuntu")
     process: Optional[str] = None# Process or executable name
-    mitre_tactics: Optional[List[str]] = None # List of MITRE IDs (e.g., ["T1110", "T1078"])
+    mitre_tactics: Optional[List[str]] = None # MITRE technique IDs (e.g., ["T1110", "T1078"])
     raw_payload: Optional[str] = None         # Original raw JSON for forensic auditing
+
+    def content_hash(self) -> str:
+        """Deterministic SHA-256 hash of identity fields for deduplication.
+
+        Two alerts are considered duplicates if they share the same timestamp,
+        rule_id, agent_name, src_ip, dst_ip, and user — i.e., the same event
+        observed at the same moment on the same host from the same source.
+        """
+        identity = f"{self.timestamp}|{self.rule_id}|{self.agent_name}|{self.src_ip}|{self.dst_ip}|{self.user}"
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 CREATE_ALERTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT NOT NULL UNIQUE,
     timestamp TEXT NOT NULL,
     rule_id TEXT NOT NULL,
     rule_level INTEGER NOT NULL,
@@ -69,60 +81,52 @@ class AlertDatabase:
         with self._get_connection() as conn:
             conn.executescript(CREATE_ALERTS_TABLE_SQL)
 
+    def _alert_to_row(self, alert: NormalizedAlert) -> tuple:
+        """Convert a NormalizedAlert to a tuple for SQL insertion."""
+        mitre_json = json.dumps(alert.mitre_tactics) if alert.mitre_tactics else "[]"
+        return (
+            alert.content_hash(),
+            alert.timestamp,
+            alert.rule_id,
+            alert.rule_level,
+            alert.rule_description,
+            alert.agent_name,
+            alert.src_ip,
+            alert.dst_ip,
+            alert.user,
+            alert.process,
+            mitre_json,
+            alert.raw_payload,
+        )
+
     def insert_alert(self, alert: NormalizedAlert) -> int:
-        """Inserts a single normalized alert and returns the primary key ID."""
+        """Inserts a single normalized alert. Silently skips duplicates.
+        Returns the row ID (0 if skipped as duplicate)."""
         sql = """
-        INSERT INTO alerts (
-            timestamp, rule_id, rule_level, rule_description,
+        INSERT OR IGNORE INTO alerts (
+            content_hash, timestamp, rule_id, rule_level, rule_description,
             agent_name, src_ip, dst_ip, user, process,
             mitre_tactics, raw_payload
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-        mitre_json = json.dumps(alert.mitre_tactics) if alert.mitre_tactics else "[]"
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql, (
-                alert.timestamp,
-                alert.rule_id,
-                alert.rule_level,
-                alert.rule_description,
-                alert.agent_name,
-                alert.src_ip,
-                alert.dst_ip,
-                alert.user,
-                alert.process,
-                mitre_json,
-                alert.raw_payload
-            ))
-            return cursor.lastrowid
+            cursor.execute(sql, self._alert_to_row(alert))
+            return cursor.lastrowid if cursor.rowcount > 0 else 0
 
     def insert_batch(self, alerts: List[NormalizedAlert]) -> int:
-        """Batch inserts a list of normalized alerts within a single transaction."""
+        """Batch inserts normalized alerts within a single transaction.
+        Silently skips duplicates. Returns count of newly inserted rows."""
         if not alerts:
             return 0
         sql = """
-        INSERT INTO alerts (
-            timestamp, rule_id, rule_level, rule_description,
+        INSERT OR IGNORE INTO alerts (
+            content_hash, timestamp, rule_id, rule_level, rule_description,
             agent_name, src_ip, dst_ip, user, process,
             mitre_tactics, raw_payload
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
-        rows = []
-        for a in alerts:
-            mitre_json = json.dumps(a.mitre_tactics) if a.mitre_tactics else "[]"
-            rows.append((
-                a.timestamp,
-                a.rule_id,
-                a.rule_level,
-                a.rule_description,
-                a.agent_name,
-                a.src_ip,
-                a.dst_ip,
-                a.user,
-                a.process,
-                mitre_json,
-                a.raw_payload
-            ))
+        rows = [self._alert_to_row(a) for a in alerts]
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.executemany(sql, rows)
@@ -134,6 +138,37 @@ class AlertDatabase:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(sql, (limit,))
+            results = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                d["mitre_tactics"] = json.loads(d["mitre_tactics"]) if d["mitre_tactics"] else []
+                results.append(d)
+            return results
+
+    def fetch_time_range(self, start: str, end: str) -> List[Dict[str, Any]]:
+        """Retrieves alerts within a time range [start, end] inclusive.
+        Timestamps are compared lexicographically (ISO 8601 sorts correctly)."""
+        sql = """
+        SELECT * FROM alerts
+        WHERE timestamp >= ? AND timestamp <= ?
+        ORDER BY timestamp ASC, id ASC
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, (start, end))
+            results = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                d["mitre_tactics"] = json.loads(d["mitre_tactics"]) if d["mitre_tactics"] else []
+                results.append(d)
+            return results
+
+    def fetch_all(self) -> List[Dict[str, Any]]:
+        """Retrieves all alerts ordered by timestamp ascending."""
+        sql = "SELECT * FROM alerts ORDER BY timestamp ASC, id ASC"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql)
             results = []
             for row in cursor.fetchall():
                 d = dict(row)
