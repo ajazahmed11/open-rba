@@ -24,3 +24,8 @@ data/cache/
 .vscode/
 .idea/
 .~lock.*#
+
+# Academic Proposals, Dissertations & Private Documents
+docs/*.pdf
+docs/*.docx
+docs/*.pptx
