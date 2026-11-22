@@ -14,26 +14,51 @@ This is pure noise reduction. Scoring happens in Module 5.
 """
 
 import re
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def parse_timestamp(ts: str) -> datetime:
-    """Parse ISO 8601 timestamp, handling Wazuh format variants.
+def parse_timestamp(ts: Optional[str]) -> datetime:
+    """Parse ISO 8601 timestamp, handling Wazuh format variants safely.
 
     Handles:
       - 2026-10-05T10:14:01.120+0000   (offset without colon)
       - 2026-10-05T10:14:15.000Z       (UTC Z suffix)
       - 2026-10-05T10:14:30.500+00:00  (standard offset)
+      - 2026-10-05T10:14:30            (naive timestamp, normalized to UTC)
+      - Empty or malformed strings     (falls back safely to UTC now)
+
+    Guarantees that all returned datetimes are timezone-aware in UTC,
+    preventing TypeError on offset-naive and offset-aware comparisons.
     """
-    # Normalize bare 4-digit timezone offset → colon-separated
-    ts = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', ts)
-    return datetime.fromisoformat(ts)
+    if not ts or not isinstance(ts, str) or not ts.strip():
+        return datetime.now(timezone.utc)
+
+    ts_clean = ts.strip()
+    try:
+        # Normalize bare 4-digit timezone offset (+0000 -> +00:00)
+        ts_clean = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', ts_clean)
+        # Normalize trailing Z to +00:00
+        if ts_clean.endswith("Z"):
+            ts_clean = ts_clean[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(ts_clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except Exception as e:
+        logger.warning(f"Failed to parse timestamp '{ts}': {e}. Using current UTC time.")
+        return datetime.now(timezone.utc)
 
 
 def extract_technique_family(mitre_techniques: List[str], rule_id: str) -> str:

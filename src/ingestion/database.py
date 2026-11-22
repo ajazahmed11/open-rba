@@ -56,6 +56,13 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS dead_letter (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_payload TEXT,
+    error_reason TEXT,
+    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts (timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_src_ip ON alerts (src_ip);
 CREATE INDEX IF NOT EXISTS idx_alerts_rule_id ON alerts (rule_id);
@@ -99,38 +106,65 @@ class AlertDatabase:
             alert.raw_payload,
         )
 
+    def record_dead_letter(self, raw_payload: str, error_reason: str) -> None:
+        """Stores a malformed or rejected alert in the dead_letter table for auditing."""
+        sql = "INSERT INTO dead_letter (raw_payload, error_reason) VALUES (?, ?)"
+        try:
+            with self._get_connection() as conn:
+                conn.cursor().execute(sql, (raw_payload, error_reason))
+        except Exception:
+            pass
+
     def insert_alert(self, alert: NormalizedAlert) -> int:
-        """Inserts a single normalized alert. Silently skips duplicates.
+        """Inserts a single normalized alert, skipping duplicates on content_hash.
         Returns the row ID (0 if skipped as duplicate)."""
         sql = """
-        INSERT OR IGNORE INTO alerts (
+        INSERT INTO alerts (
             content_hash, timestamp, rule_id, rule_level, rule_description,
             agent_name, src_ip, dst_ip, user, process,
             mitre_tactics, raw_payload
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(content_hash) DO NOTHING
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql, self._alert_to_row(alert))
-            return cursor.lastrowid if cursor.rowcount > 0 else 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, self._alert_to_row(alert))
+                return cursor.lastrowid if cursor.rowcount > 0 else 0
+        except sqlite3.IntegrityError as e:
+            self.record_dead_letter(alert.raw_payload or "", f"IntegrityError: {e}")
+            return 0
+        except Exception as e:
+            self.record_dead_letter(alert.raw_payload or "", f"InsertError: {e}")
+            return 0
 
     def insert_batch(self, alerts: List[NormalizedAlert]) -> int:
         """Batch inserts normalized alerts within a single transaction.
-        Silently skips duplicates. Returns count of newly inserted rows."""
+        Skips duplicates on content_hash conflict. Returns count of newly inserted rows."""
         if not alerts:
             return 0
         sql = """
-        INSERT OR IGNORE INTO alerts (
+        INSERT INTO alerts (
             content_hash, timestamp, rule_id, rule_level, rule_description,
             agent_name, src_ip, dst_ip, user, process,
             mitre_tactics, raw_payload
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(content_hash) DO NOTHING
         """
-        rows = [self._alert_to_row(a) for a in alerts]
+        inserted_count = 0
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.executemany(sql, rows)
-            return cursor.rowcount
+            for alert in alerts:
+                try:
+                    cursor.execute(sql, self._alert_to_row(alert))
+                    if cursor.rowcount > 0:
+                        inserted_count += 1
+                except sqlite3.IntegrityError as e:
+                    self.record_dead_letter(alert.raw_payload or "", f"IntegrityError: {e}")
+                except Exception as e:
+                    self.record_dead_letter(alert.raw_payload or "", f"BatchInsertError: {e}")
+            conn.commit()
+        return inserted_count
 
     def fetch_recent(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Retrieves the most recent alerts ordered by timestamp descending."""

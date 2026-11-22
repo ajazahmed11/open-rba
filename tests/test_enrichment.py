@@ -108,3 +108,17 @@ class TestThreatIntelClient:
         assert 0.75 < report.decayed_score < 0.85  # exp(-0.05 * 4) ~= 0.818
         assert report.indicator_age_days == 4.0
         assert report.source == "mock"
+
+    def test_cache_ttl_expiration(self, tmp_path):
+        client = ThreatIntelClient(db_path=str(tmp_path / "cti.db"), cache_ttl_days=1)
+        # Put an entry with cached_at in the past (> 2 days ago)
+        sql = """
+        INSERT INTO cti_cache (ip, raw_score, normalized_score, last_reported_at, cached_at, source)
+        VALUES ('198.51.100.5', 90.0, 0.9, '2026-09-01T00:00:00Z', '2026-09-02 00:00:00', 'abuseipdb')
+        """
+        with client.cache._get_connection() as conn:
+            conn.cursor().execute(sql)
+
+        # Lookup should detect cache is expired and fallback to unknown/live
+        report = client.lookup_ip("198.51.100.5")
+        assert report.source == "unknown"  # Expired cache entry ignored!

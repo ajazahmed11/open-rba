@@ -34,6 +34,12 @@ def test_full_pipeline_sample_alerts(tmp_path):
     risks = [s.incident_risk for s in scored]
     assert risks == sorted(risks, reverse=True)
 
+    # With dynamic weight renormalization, the Level 12 Privilege Escalation (sudoers modification)
+    # is ranked #1 (instead of being penalized by missing external CTI)
+    assert scored[0].attack.primary_tactic == "Privilege Escalation"
+    assert "sudoers" in scored[0].incident.representative_description.lower()
+    assert scored[0].score_breakdown["renormalized"] is True
+
     # Check ranked entities
     entities = results["entities"]
     assert len(entities) == 2  # web01 and db01

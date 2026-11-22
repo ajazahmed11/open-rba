@@ -1,11 +1,12 @@
 """
-MITRE ATT&CK Mapping & Kill-Chain Progression Engine for Open-RBA (Module 4).
+MITRE ATT&CK Mapping & Intrusion Criticality Engine for Open-RBA (Module 4).
 
 Maps security alert indicators and technique IDs into standard MITRE ATT&CK
-tactics, evaluating tactical depth across the cyber intrusion lifecycle:
-    Reconnaissance (Stage 1) -> Initial Access (Stage 2) -> ... -> Impact (Stage 10).
+tactics, evaluating tactical criticality across the intrusion lifecycle:
+    Reconnaissance (Stage 1) -> Initial Access (Stage 4) -> ... -> Impact (Stage 10).
 
-Provides behavioral heuristic inference for alerts missing explicit MITRE annotations.
+Provides behavioral heuristic inference using strict word boundaries to avoid
+false positive heuristic mappings (e.g., distinguishing password change from brute force).
 """
 
 import re
@@ -14,24 +15,24 @@ from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
-# MITRE ATT&CK Enterprise Tactics & Chronological Stages
+# MITRE ATT&CK Enterprise Tactics & Intrusion Criticality Stages (1 to 10)
 # ---------------------------------------------------------------------------
 
 TACTIC_STAGES = {
-    "Reconnaissance": 1,
-    "Resource Development": 1,
-    "Initial Access": 2,
-    "Execution": 3,
-    "Persistence": 4,
-    "Privilege Escalation": 5,
-    "Defense Evasion": 5,
-    "Credential Access": 6,
-    "Discovery": 6,
-    "Lateral Movement": 7,
-    "Collection": 8,
-    "Command and Control": 8,
-    "Exfiltration": 9,
-    "Impact": 10,
+    "Reconnaissance": 1,        # Pre-attack probing (0.10)
+    "Discovery": 2,             # Environment / network discovery (0.20)
+    "Resource Development": 2,  # Infrastructure preparation (0.20)
+    "Initial Access": 4,        # Perimeter breach / exploitation (0.40)
+    "Execution": 5,             # Adversary code running on target (0.50)
+    "Persistence": 6,           # Maintaining access (0.60)
+    "Defense Evasion": 7,       # Evading detection / log tampering (0.70)
+    "Credential Access": 8,     # Dumping credentials / brute force (0.80)
+    "Lateral Movement": 8,      # Internal network pivoting (0.80)
+    "Collection": 8,            # Staging internal target data (0.80)
+    "Command and Control": 8,   # C2 channel established (0.80)
+    "Privilege Escalation": 9,  # Root / Administrator compromise (0.90)
+    "Exfiltration": 10,         # Stealing sensitive organizational data (1.00)
+    "Impact": 10,               # Destruction / ransomware encryption (1.00)
 }
 
 TACTIC_IDS = {
@@ -55,6 +56,8 @@ TACTIC_IDS = {
 TECHNIQUE_MAP: Dict[str, Tuple[str, str]] = {
     "T1595": ("Reconnaissance", "Active Scanning"),
     "T1590": ("Reconnaissance", "Gather Victim Network Information"),
+    "T1046": ("Discovery", "Network Service Discovery"),
+    "T1082": ("Discovery", "System Information Discovery"),
     "T1190": ("Initial Access", "Exploit Public-Facing Application"),
     "T1566": ("Initial Access", "Phishing"),
     "T1078": ("Initial Access", "Valid Accounts"),
@@ -68,8 +71,6 @@ TECHNIQUE_MAP: Dict[str, Tuple[str, str]] = {
     "T1562": ("Defense Evasion", "Impair Defenses"),
     "T1110": ("Credential Access", "Brute Force"),
     "T1003": ("Credential Access", "OS Credential Dumping"),
-    "T1046": ("Discovery", "Network Service Discovery"),
-    "T1082": ("Discovery", "System Information Discovery"),
     "T1021": ("Lateral Movement", "Remote Services"),
     "T1005": ("Collection", "Data from Local System"),
     "T1071": ("Command and Control", "Application Layer Protocol"),
@@ -81,17 +82,17 @@ TECHNIQUE_MAP: Dict[str, Tuple[str, str]] = {
 
 @dataclass
 class ATTACKProfile:
-    """Evaluated tactical depth profile for an incident."""
+    """Evaluated tactical criticality profile for an incident."""
     primary_technique: str
     primary_tactic: str
     tactic_id: str
-    stage_depth: int           # Integer score from 1 (Recon) to 10 (Impact)
+    stage_depth: int           # Criticality score from 1 (Recon) to 10 (Impact)
     normalized_depth: float    # Normalization mapped strictly to [0.1, 1.0]
     inferred: bool             # True if derived via heuristic fallback
 
 
 class ATTACKMapper:
-    """Maps alerts to MITRE ATT&CK taxonomy and computes kill-chain progression."""
+    """Maps alerts to MITRE ATT&CK taxonomy and computes intrusion criticality."""
 
     def __init__(self):
         self.technique_map = TECHNIQUE_MAP
@@ -104,7 +105,7 @@ class ATTACKMapper:
         rule_id: str = ""
     ) -> ATTACKProfile:
         """
-        Determines the highest tactical depth reached by an incident.
+        Determines the highest tactical criticality reached by an incident.
         If explicit techniques are provided, evaluates their tactics.
         Otherwise, infers tactical category from rule description or ID.
         """
@@ -124,7 +125,7 @@ class ATTACKMapper:
             stage = self.tactic_stages.get(inferred_tactic, 1)
             candidates.append((inferred_tech, inferred_tactic, stage, True))
 
-        # Pick candidate with deepest kill-chain progression
+        # Pick candidate with deepest intrusion criticality
         best = max(candidates, key=lambda c: c[2])
         tech, tactic, stage, inferred = best
         tactic_id = TACTIC_IDS.get(tactic, "TA0043")
@@ -140,20 +141,32 @@ class ATTACKMapper:
         )
 
     def _infer_from_rule(self, description: str, rule_id: str) -> Tuple[str, str]:
-        """Heuristic behavioral pattern matching for alerts lacking MITRE tags."""
-        desc_lower = description.lower()
+        """Strict word-boundary heuristic pattern matching for alerts lacking MITRE tags."""
+        desc = description.lower()
 
-        if any(w in desc_lower for w in ["brute force", "failed login", "password", "authentication failed"]):
-            return "T1110", "Credential Access"
-        if any(w in desc_lower for w in ["sudo", "sudoers", "privilege", "root", "elevation"]):
+        # Guard against false positives like "rootcheck scan" or "password changed"
+        if re.search(r'\b(rootcheck|syscheck\s+scan)\b', desc):
+            return "T1082", "Discovery"
+
+        if re.search(r'\b(password\s+(changed|updated|reset))\b', desc):
+            return "T1078", "Initial Access"
+
+        if re.search(r'\b(sudoers?|privilege\s+escalation|elevation\s+of\s+privilege|gained\s+root)\b', desc):
             return "T1548", "Privilege Escalation"
-        if any(w in desc_lower for w in ["traversal", "sql injection", "sqli", "xss", "web attack", "exploit"]):
+
+        if re.search(r'\b(brute\s*force|failed\s+login|password\s+guessing|auth(entication)?\s+failed)\b', desc):
+            return "T1110", "Credential Access"
+
+        if re.search(r'\b(traversal|sql\s*injection|sqli|cross\s*site|xss|rce|remote\s+code|exploit)\b', desc):
             return "T1190", "Initial Access"
-        if any(w in desc_lower for w in ["scan", "nmap", "reconnaissance", "port scan", "sweep"]):
+
+        if re.search(r'\b(nmap|port\s+scan|syn\s+scan|network\s+recon|service\s+scan)\b', desc):
             return "T1046", "Discovery"
-        if any(w in desc_lower for w in ["tamper", "integrity", "log cleared", "audit"]):
+
+        if re.search(r'\b(tamper|integrity|log\s+cleared|audit\s+log|defense\s+evasion)\b', desc):
             return "T1070", "Defense Evasion"
-        if any(w in desc_lower for w in ["powershell", "bash", "command", "shell"]):
+
+        if re.search(r'\b(powershell|bash|shell|exec(ute)?\s+command)\b', desc):
             return "T1059", "Execution"
 
         # Default fallback

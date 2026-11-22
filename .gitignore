@@ -30,3 +30,5 @@ docs/*.pdf
 docs/*.docx
 docs/*.pptx
 docs/screenshots/
+docs/*logo*
+scripts/

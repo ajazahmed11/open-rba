@@ -260,3 +260,50 @@ def test_wazuh_client_ingest_file_idempotent(tmp_path):
     assert count1 == 1
     assert count2 == 0  # duplicate, nothing new
     assert client.db.count() == 1
+
+
+def test_wazuh_client_ingest_file_tail_limit(tmp_path):
+    """When limit is passed, ingest_from_file must tail the newest N lines."""
+    db_file = tmp_path / "test_tail.db"
+    sample_file = tmp_path / "alerts_tail.json"
+
+    lines = [
+        json.dumps({
+            "timestamp": f"2026-10-05T10:0{i}:00Z",
+            "rule": {"id": f"571{i}", "level": 5, "description": f"Event {i}"},
+            "agent": {"name": "web01"}
+        })
+        for i in range(5)
+    ]
+    sample_file.write_text("\n".join(lines), encoding="utf-8")
+
+    client = WazuhClient(str(db_file))
+    count = client.ingest_from_file(str(sample_file), limit=2)
+    assert count == 2
+    # The two alerts in the database should be Event 3 and Event 4 (the newest lines)
+    recent = client.db.fetch_recent(2)
+    rule_ids = {r["rule_id"] for r in recent}
+    assert rule_ids == {"5713", "5714"}
+
+
+def test_dead_letter_recording(tmp_path):
+    """Malformed alerts are routed to the dead_letter table without crashing."""
+    db_file = tmp_path / "test_dead_letter.db"
+    sample_file = tmp_path / "alerts_malformed.json"
+
+    content = "THIS IS NOT JSON\n" + json.dumps({
+        "timestamp": "2026-10-05T10:00:00Z",
+        "rule": {"id": "5712", "level": 10, "description": "Valid"},
+        "agent": {"name": "web01"}
+    }) + "\n"
+    sample_file.write_text(content, encoding="utf-8")
+
+    client = WazuhClient(str(db_file))
+    count = client.ingest_from_file(str(sample_file))
+    assert count == 1
+    # Check that dead_letter table received the bad line
+    with client.db._get_connection() as conn:
+        rows = conn.cursor().execute("SELECT * FROM dead_letter").fetchall()
+        assert len(rows) == 1
+        assert "THIS IS NOT JSON" in rows[0]["raw_payload"]
+

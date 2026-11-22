@@ -2,17 +2,29 @@
 Dynamic Multi-Factor Risk Scoring Engine for Open-RBA (Module 5).
 
 Implements normalized, mathematically bounded multi-factor risk scoring
-and entity-centric aggregation.
+and entity-centric aggregation with dynamic weight renormalization and
+diminishing-returns volume damping.
 
 Formulation:
-    R_base = w_sev * S_norm + w_cti * CTI_decayed + w_kc * KC_norm   (in [0.0, 1.0])
-    R_incident = R_base * Asset_Multiplier                           (in [0.0, 3.0])
-    R_entity = (sum(R_incident)) * Tactics_Depth_Bonus
+    1. Dynamic Weight Renormalization:
+       If CTI is applicable (external indicator present):
+           w'_sev = w_sev, w'_cti = w_cti, w'_kc = w_kc
+       Else (local host alert, private IP, missing/failed CTI):
+           w'_cti = 0.0
+           w'_sev = w_sev / (w_sev + w_kc)
+           w'_kc  = w_kc  / (w_sev + w_kc)
 
-Ensures that high-value assets amplify confirmed threats without triggering
-phantom alerts on benign activity.
+    2. Normalized Incident Risk:
+       R_base = w'_sev * S_norm + w'_cti * CTI_decayed + w'_kc * KC_norm   (in [0.0, 1.0])
+       R_incident = R_base * Asset_Multiplier                             (in [0.0, 3.0])
+
+    3. Bounded Entity Aggregation (Diminishing Marginal Risk):
+       R_effective = R_0 + sum_{i=1..n-1} (R_i / (1 + ln(1 + i)))
+       R_entity = R_effective * Tactics_Depth_Bonus
 """
 
+import re
+import math
 import yaml
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -33,7 +45,7 @@ class ScoredIncident:
     asset_tier: str               # "critical", "high", "medium", or "low"
     asset_multiplier: float       # 1.0 to 3.0
     incident_risk: float          # Final incident score in [0.0, 3.0]
-    score_breakdown: Dict[str, float]
+    score_breakdown: Dict[str, Any]
 
 
 @dataclass
@@ -47,6 +59,7 @@ class EntityIncident:
     tactics_depth_bonus: float
     total_entity_risk: float
     incidents: List[ScoredIncident]
+    raw_incident_risk_sum: float = 0.0
 
 
 class RiskScoringEngine:
@@ -108,18 +121,39 @@ class RiskScoringEngine:
         return self.DEFAULT_CONFIG
 
     def get_asset_context(self, agent_name: str) -> tuple[str, float]:
-        """Resolves asset tier name and multiplier for a host."""
-        tier = self.asset_hosts.get(agent_name.lower())
+        """Resolves asset tier name and multiplier for a host using robust tokenization."""
+        name_lower = agent_name.lower()
+
+        # Direct explicit host lookup
+        tier = self.asset_hosts.get(name_lower)
         if tier and tier in self.asset_tiers:
             return tier, float(self.asset_tiers[tier])
 
-        # Heuristic role detection if not explicitly mapped
-        name_lower = agent_name.lower()
-        if any(k in name_lower for k in ["dc", "domain", "db", "database", "ldap"]):
+        # Tokenize by non-alphanumeric delimiters to avoid substring false positives
+        # (e.g. "capital-kiosk" shouldn't trigger "api", "dbadmin-laptop" shouldn't trigger "db")
+        tokens = set(re.split(r'[-_.\s0-9]+', name_lower))
+        tokens.discard("")
+
+        # Endpoint / workstation tokens (demote priority)
+        endpoint_tokens = {"laptop", "workstation", "pc", "kiosk", "desktop", "client", "endpoint"}
+        is_endpoint = bool(tokens & endpoint_tokens)
+
+        # Critical infrastructure tokens (only if not an end-user device)
+        critical_tokens = {"dc", "domain", "db", "database", "ldap", "pki", "vault", "auth", "ad"}
+        if not is_endpoint and (tokens & critical_tokens):
             return "critical", float(self.asset_tiers.get("critical", 3.0))
-        if any(k in name_lower for k in ["web", "api", "gateway", "proxy"]):
+
+        # High value server roles
+        high_tokens = {"web", "api", "gateway", "proxy", "nginx", "apache", "prod", "production"}
+        if not is_endpoint and (tokens & high_tokens):
             return "high", float(self.asset_tiers.get("high", 2.0))
-        if any(k in name_lower for k in ["stage", "test", "dev", "ephemeral"]):
+
+        # Low value / ephemeral / test assets
+        low_tokens = {"stage", "staging", "test", "dev", "ephemeral", "sandbox", "lab", "kiosk"}
+        if tokens & low_tokens:
+            return "low", float(self.asset_tiers.get("low", 1.0))
+
+        if is_endpoint:
             return "low", float(self.asset_tiers.get("low", 1.0))
 
         return "medium", self.default_criticality
@@ -130,7 +164,7 @@ class RiskScoringEngine:
         cti: CTIReport,
         attack: ATTACKProfile
     ) -> ScoredIncident:
-        """Calculates normalized multi-factor risk score for an incident."""
+        """Calculates normalized multi-factor risk score for an incident with dynamic CTI renormalization."""
         # Factor 1: Normalized static severity [0.0, 1.0]
         s_norm = max(0.0, min(1.0, incident.max_severity / 15.0))
 
@@ -140,8 +174,31 @@ class RiskScoringEngine:
         # Factor 3: Normalized kill-chain progression depth [0.1, 1.0]
         kc_norm = max(0.1, min(1.0, attack.normalized_depth))
 
+        # Dynamic Weight Renormalization:
+        # If CTI is not applicable (internal host, private IP, local event, or lookup unavailable),
+        # renormalize remaining weights so missing external intelligence does not penalize local incidents.
+        has_applicable_cti = (
+            not cti.is_private
+            and incident.src_ip is not None
+            and cti.source not in ("local", "unknown", "error")
+        )
+
+        if has_applicable_cti:
+            eff_w_sev = self.w_sev
+            eff_w_cti = self.w_cti
+            eff_w_kc = self.w_kc
+        else:
+            eff_w_cti = 0.0
+            sum_remaining = self.w_sev + self.w_kc
+            if sum_remaining > 0:
+                eff_w_sev = self.w_sev / sum_remaining
+                eff_w_kc = self.w_kc / sum_remaining
+            else:
+                eff_w_sev = 0.5
+                eff_w_kc = 0.5
+
         # Base Risk sum in [0.0, 1.0]
-        base_risk = (self.w_sev * s_norm) + (self.w_cti * cti_norm) + (self.w_kc * kc_norm)
+        base_risk = (eff_w_sev * s_norm) + (eff_w_cti * cti_norm) + (eff_w_kc * kc_norm)
         base_risk = round(base_risk, 4)
 
         # Contextual Asset Multiplier [1.0, 3.0]
@@ -152,11 +209,17 @@ class RiskScoringEngine:
 
         breakdown = {
             "severity_norm": round(s_norm, 4),
-            "severity_weighted": round(self.w_sev * s_norm, 4),
+            "severity_weighted": round(eff_w_sev * s_norm, 4),
             "cti_decayed": round(cti_norm, 4),
-            "cti_weighted": round(self.w_cti * cti_norm, 4),
+            "cti_weighted": round(eff_w_cti * cti_norm, 4),
             "kill_chain_norm": round(kc_norm, 4),
-            "kill_chain_weighted": round(self.w_kc * kc_norm, 4),
+            "kill_chain_weighted": round(eff_w_kc * kc_norm, 4),
+            "renormalized": not has_applicable_cti,
+            "effective_weights": {
+                "severity": round(eff_w_sev, 4),
+                "threat_intel": round(eff_w_cti, 4),
+                "kill_chain": round(eff_w_kc, 4),
+            },
             "base_risk": base_risk,
             "asset_multiplier": asset_mult
         }
@@ -194,8 +257,9 @@ class RiskScoringEngine:
 
     def aggregate_by_entity(self, scored_incidents: List[ScoredIncident]) -> List[EntityIncident]:
         """
-        Groups scored incidents by target entity (host), applying tactical
-        depth progression multiplier to multi-stage intrusions.
+        Groups scored incidents by target entity (host), applying logarithmic
+        diminishing marginal risk to bound repeated incident storms and applying
+        tactical depth bonuses to multi-stage intrusions.
         """
         by_host: Dict[str, List[ScoredIncident]] = {}
         for s in scored_incidents:
@@ -215,8 +279,21 @@ class RiskScoringEngine:
             else:
                 depth_bonus = 1.0  # Single tactic activity
 
-            incident_risk_sum = sum(inc.incident_risk for inc in host_incidents)
-            total_entity_risk = round(incident_risk_sum * depth_bonus, 3)
+            # Sort incidents descending by incident risk
+            sorted_incidents = sorted(host_incidents, key=lambda x: x.incident_risk, reverse=True)
+            raw_incident_risk_sum = round(sum(inc.incident_risk for inc in sorted_incidents), 3)
+
+            # Diminishing returns curve: primary incident contributes 100%, subsequent incidents
+            # contribute with logarithmic dampening to prevent volume spam from overtaking root compromises:
+            # R_effective = R_0 + sum_{i=1..n-1} (R_i / (1 + ln(1 + i)))
+            if sorted_incidents:
+                effective_risk = sorted_incidents[0].incident_risk
+                for i, inc in enumerate(sorted_incidents[1:], 1):
+                    effective_risk += inc.incident_risk / (1.0 + math.log(1.0 + i))
+            else:
+                effective_risk = 0.0
+
+            total_entity_risk = round(effective_risk * depth_bonus, 3)
 
             entities.append(EntityIncident(
                 agent_name=host,
@@ -226,8 +303,10 @@ class RiskScoringEngine:
                 distinct_tactics=sorted(list(all_tactics)),
                 tactics_depth_bonus=depth_bonus,
                 total_entity_risk=total_entity_risk,
-                incidents=sorted(host_incidents, key=lambda x: x.incident_risk, reverse=True)
+                incidents=sorted_incidents,
+                raw_incident_risk_sum=raw_incident_risk_sum
             ))
 
         entities.sort(key=lambda e: e.total_entity_risk, reverse=True)
         return entities
+

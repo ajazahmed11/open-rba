@@ -13,13 +13,17 @@ import os
 import math
 import json
 import sqlite3
+import logging
 import ipaddress
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -147,7 +151,7 @@ class CTICache:
 class ThreatIntelClient:
     """
     Enriches indicators with threat reputation and exponential decay.
-    Supports AbuseIPDB API, persistent SQLite caching, and offline mock datasets.
+    Supports AbuseIPDB API, persistent SQLite caching with TTL, and offline datasets.
     """
 
     def __init__(
@@ -156,12 +160,14 @@ class ThreatIntelClient:
         db_path: str = "data/alerts.db",
         lambda_factor: float = 0.05,
         max_age_days: int = 90,
+        cache_ttl_days: int = 7,
         mock_data: Optional[Dict[str, Dict[str, Any]]] = None
     ):
         self.api_key = api_key or os.getenv("ABUSEIPDB_API_KEY")
         self.cache = CTICache(db_path)
         self.lambda_factor = lambda_factor
         self.max_age_days = max_age_days
+        self.cache_ttl_days = cache_ttl_days
         self.mock_data = mock_data or {}
 
     def lookup_ip(self, ip: Optional[str], alert_timestamp: Optional[str] = None) -> CTIReport:
@@ -200,26 +206,40 @@ class ThreatIntelClient:
                 source="mock"
             )
 
-        # Check local SQLite cache
+        # Check local SQLite cache with TTL expiration
         cached = self.cache.get(ip_clean)
         if cached:
-            norm_score = cached["normalized_score"]
-            raw_score = cached["raw_score"]
-            age_days = self._compute_age_days(cached["last_reported_at"], alert_timestamp)
-            decayed = calculate_temporal_decay(norm_score, age_days, self.lambda_factor, self.max_age_days)
-            return CTIReport(
-                ip=ip_clean,
-                raw_score=raw_score,
-                normalized_score=norm_score,
-                decayed_score=decayed,
-                indicator_age_days=age_days,
-                is_private=False,
-                source="cache"
-            )
+            cached_at_str = cached.get("cached_at", "")
+            is_valid = True
+            if cached_at_str:
+                try:
+                    cached_dt = datetime.fromisoformat(cached_at_str.replace("Z", "+00:00"))
+                    if cached_dt.tzinfo is None:
+                        cached_dt = cached_dt.replace(tzinfo=timezone.utc)
+                    cache_age_days = (datetime.now(timezone.utc) - cached_dt).total_seconds() / 86400.0
+                    if cache_age_days > self.cache_ttl_days:
+                        is_valid = False
+                except Exception:
+                    is_valid = True
+
+            if is_valid:
+                norm_score = cached["normalized_score"]
+                raw_score = cached["raw_score"]
+                age_days = self._compute_age_days(cached["last_reported_at"], alert_timestamp)
+                decayed = calculate_temporal_decay(norm_score, age_days, self.lambda_factor, self.max_age_days)
+                return CTIReport(
+                    ip=ip_clean,
+                    raw_score=raw_score,
+                    normalized_score=norm_score,
+                    decayed_score=decayed,
+                    indicator_age_days=age_days,
+                    is_private=False,
+                    source="cache"
+                )
 
         # Live API query if API key is present
         if self.api_key and self.api_key != "your_abuseipdb_api_key_here":
-            api_res = self._query_abuseipdb(ip_clean)
+            api_res, query_status = self._query_abuseipdb(ip_clean)
             if api_res:
                 raw_score = float(api_res.get("abuseConfidenceScore", 0.0))
                 norm_score = max(0.0, min(1.0, raw_score / 100.0))
@@ -236,6 +256,17 @@ class ThreatIntelClient:
                     is_private=False,
                     source="abuseipdb"
                 )
+            elif query_status in ("rate_limited", "error"):
+                # Differentiate lookup failure from a clean IP so weight renormalization applies
+                return CTIReport(
+                    ip=ip_clean,
+                    raw_score=0.0,
+                    normalized_score=0.0,
+                    decayed_score=0.0,
+                    indicator_age_days=0.0,
+                    is_private=False,
+                    source="error"
+                )
 
         # Graceful fallback when offline / no key
         return CTIReport(
@@ -248,8 +279,8 @@ class ThreatIntelClient:
             source="unknown"
         )
 
-    def _query_abuseipdb(self, ip: str) -> Optional[Dict[str, Any]]:
-        """Queries AbuseIPDB REST API v2."""
+    def _query_abuseipdb(self, ip: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Queries AbuseIPDB REST API v2, returning data and status."""
         url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={urllib.parse.quote(ip)}&maxAgeInDays=90"
         headers = {
             "Key": self.api_key,
@@ -259,9 +290,16 @@ class ThreatIntelClient:
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                return data.get("data")
-        except Exception:
-            return None
+                return data.get("data"), "ok"
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                logger.warning(f"AbuseIPDB rate limit exceeded (HTTP 429) for IP {ip}")
+                return None, "rate_limited"
+            logger.warning(f"AbuseIPDB HTTP error {e.code} for IP {ip}: {e}")
+            return None, "error"
+        except Exception as e:
+            logger.warning(f"AbuseIPDB request failed for IP {ip}: {e}")
+            return None, "error"
 
     def _compute_age_days(self, reported_at_iso: str, alert_ts_iso: Optional[str]) -> float:
         """Calculates delta_t (in days) between indicator report and alert occurrence."""

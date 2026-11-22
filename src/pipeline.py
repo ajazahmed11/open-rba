@@ -10,9 +10,16 @@ Executes the complete 5-stage Risk-Based Alerting pipeline:
 """
 
 import sys
+import os
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from src.ingestion.wazuh_client import WazuhClient
 from src.ingestion.database import AlertDatabase
@@ -22,6 +29,18 @@ from src.attck.mapper import ATTACKMapper
 from src.scoring.engine import RiskScoringEngine, ScoredIncident, EntityIncident
 
 
+DEFAULT_MOCK_INTEL = {
+    "203.0.113.45": {
+        "score": 88.0,
+        "last_reported_at": "2026-10-01T08:00:00Z"
+    },
+    "198.51.100.99": {
+        "score": 45.0,
+        "last_reported_at": "2026-09-20T00:00:00Z"
+    }
+}
+
+
 class OpenRBAPipeline:
     """Orchestrates the 5-stage Open-RBA incident prioritization workflow."""
 
@@ -29,7 +48,8 @@ class OpenRBAPipeline:
         self,
         db_path: str = "data/alerts.db",
         weights_config: str = "config/weights.yaml",
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        mock_intel: Optional[Dict[str, Any]] = None
     ):
         base_dir = Path(__file__).parent.parent
         resolved_db = db_path if Path(db_path).is_absolute() else str(base_dir / db_path)
@@ -46,24 +66,15 @@ class OpenRBAPipeline:
         lambda_factor = float(decay_cfg.get("lambda_factor", 0.05))
         max_age_days = int(decay_cfg.get("max_indicator_age_days", 90))
 
-        # Sample mock intelligence for offline demo & testing
-        mock_intel = {
-            "203.0.113.45": {
-                "score": 88.0,
-                "last_reported_at": "2026-10-01T08:00:00Z"
-            },
-            "198.51.100.99": {
-                "score": 45.0,
-                "last_reported_at": "2026-09-20T00:00:00Z"
-            }
-        }
+        # Configurable mock intelligence for offline testing
+        active_mock_intel = mock_intel if mock_intel is not None else DEFAULT_MOCK_INTEL
 
         self.cti_client = ThreatIntelClient(
-            api_key=api_key,
+            api_key=api_key or os.getenv("ABUSEIPDB_API_KEY"),
             db_path=resolved_db,
             lambda_factor=lambda_factor,
             max_age_days=max_age_days,
-            mock_data=mock_intel
+            mock_data=active_mock_intel
         )
 
     def run(

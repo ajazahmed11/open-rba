@@ -55,7 +55,26 @@ class TestParseTimestamp:
 
     def test_positive_offset(self):
         dt = parse_timestamp("2026-10-05T15:44:01.000+0530")
-        assert dt.hour == 15
+        assert dt.hour == 10 and dt.minute == 14  # Normalized to UTC!
+
+    def test_naive_timestamp_normalized_to_utc(self):
+        dt = parse_timestamp("2026-10-05T10:14:01")
+        assert dt.tzinfo is not None
+        assert dt.hour == 10
+
+    def test_empty_or_none_timestamp_fallback(self):
+        dt_empty = parse_timestamp("")
+        dt_none = parse_timestamp(None)
+        assert dt_empty.tzinfo is not None
+        assert dt_none.tzinfo is not None
+
+    def test_mixed_naive_and_aware_correlation(self):
+        # Alerts with naive and aware timestamps should not crash with TypeError
+        a1 = _alert(1, "2026-10-05T10:14:01", "5710", 5, "SSH failed", "web01", "203.0.113.45")
+        a2 = _alert(2, "2026-10-05T10:14:10Z", "5710", 5, "SSH failed", "web01", "203.0.113.45")
+        incidents = correlate_alerts([a1, a2], window_seconds=120)
+        assert len(incidents) == 1
+        assert incidents[0].alert_count == 2
 
 
 class TestExtractTechniqueFamily:
