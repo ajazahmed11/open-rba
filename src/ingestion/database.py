@@ -26,15 +26,16 @@ class NormalizedAlert:
     process: Optional[str] = None# Process or executable name
     mitre_tactics: Optional[List[str]] = None # MITRE technique IDs (e.g., ["T1110", "T1078"])
     raw_payload: Optional[str] = None         # Original raw JSON for forensic auditing
+    full_log: Optional[str] = None            # Full raw log message string
 
     def content_hash(self) -> str:
         """Deterministic SHA-256 hash of identity fields for deduplication.
 
         Two alerts are considered duplicates if they share the same timestamp,
-        rule_id, agent_name, src_ip, dst_ip, and user — i.e., the same event
-        observed at the same moment on the same host from the same source.
+        rule_id, agent_name, src_ip, dst_ip, user, and log content.
         """
-        identity = f"{self.timestamp}|{self.rule_id}|{self.agent_name}|{self.src_ip}|{self.dst_ip}|{self.user}"
+        log_key = self.full_log or self.rule_description or ""
+        identity = f"{self.timestamp}|{self.rule_id}|{self.agent_name}|{self.src_ip}|{self.dst_ip}|{self.user}|{log_key}"
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -106,12 +107,16 @@ class AlertDatabase:
             alert.raw_payload,
         )
 
-    def record_dead_letter(self, raw_payload: str, error_reason: str) -> None:
+    def record_dead_letter(self, raw_payload: str, error_reason: str, conn: Optional[sqlite3.Connection] = None) -> None:
         """Stores a malformed or rejected alert in the dead_letter table for auditing."""
         sql = "INSERT INTO dead_letter (raw_payload, error_reason) VALUES (?, ?)"
         try:
-            with self._get_connection() as conn:
+            if conn is not None:
                 conn.cursor().execute(sql, (raw_payload, error_reason))
+            else:
+                with self._get_connection() as c:
+                    c.cursor().execute(sql, (raw_payload, error_reason))
+                    c.commit()
         except Exception:
             pass
 
@@ -130,6 +135,7 @@ class AlertDatabase:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(sql, self._alert_to_row(alert))
+                conn.commit()
                 return cursor.lastrowid if cursor.rowcount > 0 else 0
         except sqlite3.IntegrityError as e:
             self.record_dead_letter(alert.raw_payload or "", f"IntegrityError: {e}")
@@ -160,9 +166,9 @@ class AlertDatabase:
                     if cursor.rowcount > 0:
                         inserted_count += 1
                 except sqlite3.IntegrityError as e:
-                    self.record_dead_letter(alert.raw_payload or "", f"IntegrityError: {e}")
+                    self.record_dead_letter(alert.raw_payload or "", f"IntegrityError: {e}", conn=conn)
                 except Exception as e:
-                    self.record_dead_letter(alert.raw_payload or "", f"BatchInsertError: {e}")
+                    self.record_dead_letter(alert.raw_payload or "", f"BatchInsertError: {e}", conn=conn)
             conn.commit()
         return inserted_count
 

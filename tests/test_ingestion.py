@@ -307,3 +307,24 @@ def test_dead_letter_recording(tmp_path):
         assert len(rows) == 1
         assert "THIS IS NOT JSON" in rows[0]["raw_payload"]
 
+
+def test_dead_letter_on_non_numeric_rule_level(tmp_path):
+    """Alerts with invalid/corrupted rule levels are routed to dead_letter."""
+    db_file = tmp_path / "test_level_dead.db"
+    sample_file = tmp_path / "alerts_corrupt_level.json"
+
+    content = json.dumps({
+        "timestamp": "2026-10-05T10:00:00Z",
+        "rule": {"id": "5712", "level": "INVALID_LEVEL", "description": "Corrupt rule"},
+        "agent": {"name": "web01"}
+    }) + "\n"
+    sample_file.write_text(content, encoding="utf-8")
+
+    client = WazuhClient(str(db_file))
+    count = client.ingest_from_file(str(sample_file))
+    assert count == 0
+    with client.db._get_connection() as conn:
+        rows = conn.cursor().execute("SELECT * FROM dead_letter").fetchall()
+        assert len(rows) == 1
+        assert "NormalizationError" in rows[0]["error_reason"]
+

@@ -173,19 +173,30 @@ def format_table(results: Dict[str, Any]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Open-RBA Prioritization Pipeline")
-    parser.add_argument("--file", type=str, default="data/sample_alerts.json",
-                        help="Path to JSON alert file to ingest and prioritize")
+    parser.add_argument("--file", type=str, default=None,
+                        help="Path to JSON alert file to ingest and prioritize (optional)")
     parser.add_argument("--db", type=str, default="data/alerts.db",
                         help="Target SQLite alerts database")
     parser.add_argument("--weights", type=str, default="config/weights.yaml",
                         help="Path to multi-factor weights configuration")
     parser.add_argument("--limit", type=int, default=500,
                         help="Maximum alerts to process")
+    parser.add_argument("--no-ingest", action="store_true",
+                        help="Skip file ingestion and score existing alerts in the database")
 
     args = parser.parse_args()
     pipeline = OpenRBAPipeline(db_path=args.db, weights_config=args.weights)
-    results = pipeline.run(file_path=args.file, limit=args.limit)
 
+    target_file = None
+    if not args.no_ingest:
+        if args.file:
+            target_file = args.file
+        elif pipeline.db.count() == 0:
+            default_sample = "data/sample_alerts.json"
+            if Path(default_sample).exists():
+                target_file = default_sample
+
+    results = pipeline.run(file_path=target_file, limit=args.limit)
     print(format_table(results))
 
 

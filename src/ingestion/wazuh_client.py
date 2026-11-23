@@ -33,7 +33,15 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
     try:
         rule_block = raw.get("rule", {})
         rule_id = str(rule_block.get("id", "0"))
-        rule_level = int(rule_block.get("level", 0))
+        
+        # Rule level must be a valid integer
+        raw_level = rule_block.get("level", 0)
+        try:
+            rule_level = int(raw_level)
+        except (ValueError, TypeError):
+            logger.warning(f"Invalid non-numeric rule level: {raw_level}")
+            return None
+
         rule_desc = rule_block.get("description", "Unknown rule")
 
         agent_block = raw.get("agent", {})
@@ -44,6 +52,7 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
         dst_ip = data_block.get("dstip") or data_block.get("dst_ip")
         user = data_block.get("dstuser") or data_block.get("srcuser") or data_block.get("user")
         process = data_block.get("process") or raw.get("program_name")
+        full_log = raw.get("full_log")
 
         # Extract MITRE ATT&CK technique IDs
         mitre_tactics = []
@@ -69,7 +78,8 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
             user=user,
             process=process,
             mitre_tactics=mitre_tactics,
-            raw_payload=raw_json_str
+            raw_payload=raw_json_str,
+            full_log=full_log
         )
     except Exception as e:
         logger.warning(f"Failed to normalize alert: {e}")
@@ -107,6 +117,8 @@ class WazuhClient:
                 norm = normalize_wazuh_alert(data)
                 if norm:
                     alerts.append(norm)
+                else:
+                    self.db.record_dead_letter(line, "NormalizationError: Malformed schema or non-numeric rule level")
             except json.JSONDecodeError as e:
                 self.db.record_dead_letter(line, f"JSONDecodeError: {e}")
                 continue
@@ -169,6 +181,8 @@ class WazuhClient:
             norm = normalize_wazuh_alert(source)
             if norm:
                 alerts.append(norm)
+            else:
+                self.db.record_dead_letter(json.dumps(source), "NormalizationError: Malformed indexer alert schema")
 
         return self.db.insert_batch(alerts)
 
