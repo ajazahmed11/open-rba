@@ -252,10 +252,10 @@ def main():
     parser = argparse.ArgumentParser(description="Open-RBA Wazuh Ingestion Client")
     parser.add_argument("--file", type=str, default="data/sample_alerts.json",
                         help="Path to JSONL alert log file to ingest")
-    parser.add_argument("--indexer", action="store_true",
-                        help="Ingest alerts from Wazuh OpenSearch Indexer (:9200)")
-    parser.add_argument("--api", action="store_true",
-                        help="Ingest alerts from Wazuh REST API (:55000)")
+    parser.add_argument("--indexer", nargs="?", const="default", default=None,
+                        help="Ingest alerts from Wazuh OpenSearch Indexer (:9200), optional custom URL")
+    parser.add_argument("--api", nargs="?", const="default", default=None,
+                        help="Ingest alerts from Wazuh REST API (:55000), optional custom URL")
     parser.add_argument("--last", type=int, default=100,
                         help="Maximum number of alerts to ingest/display")
     parser.add_argument("--db", type=str, default="data/alerts.db",
@@ -266,25 +266,38 @@ def main():
 
     verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
 
-    if args.indexer:
-        idx_url = os.getenv("WAZUH_INDEXER_URL", "https://localhost:9200")
+    if args.indexer is not None:
+        idx_url = args.indexer if args.indexer != "default" else os.getenv("WAZUH_INDEXER_URL", "https://localhost:9200")
         idx_user = os.getenv("WAZUH_INDEXER_USER", "admin")
         idx_pass = os.getenv("WAZUH_INDEXER_PASSWORD", "admin")
         print(f"Querying Wazuh Indexer at {idx_url} (limit: {args.last})...")
-        count = client.ingest_from_indexer(idx_url, user=idx_user, password=idx_pass,
-                                           verify_ssl=verify_ssl, limit=args.last)
-    elif args.api:
-        api_url = os.getenv("WAZUH_API_URL", "https://localhost:55000")
+        try:
+            count = client.ingest_from_indexer(idx_url, user=idx_user, password=idx_pass,
+                                               verify_ssl=verify_ssl, limit=args.last)
+        except Exception as e:
+            print(f"[Error] Failed to connect to Wazuh Indexer at {idx_url}: {e}", file=sys.stderr)
+            print("        Ensure Wazuh OpenSearch Indexer (:9200) is running or configure WAZUH_INDEXER_URL.", file=sys.stderr)
+            sys.exit(1)
+    elif args.api is not None:
+        api_url = args.api if args.api != "default" else os.getenv("WAZUH_API_URL", "https://localhost:55000")
         api_user = os.getenv("WAZUH_API_USER", "wazuh-wui")
         api_pass = os.getenv("WAZUH_API_PASSWORD", "")
         if not api_pass:
             print("[Error] WAZUH_API_PASSWORD environment variable not set.", file=sys.stderr)
             sys.exit(1)
         print(f"Connecting to Wazuh API at {api_url}...")
-        count = client.ingest_from_api(api_url, api_user, api_pass, verify_ssl=verify_ssl, limit=args.last)
+        try:
+            count = client.ingest_from_api(api_url, api_user, api_pass, verify_ssl=verify_ssl, limit=args.last)
+        except Exception as e:
+            print(f"[Error] Failed to connect to Wazuh API at {api_url}: {e}", file=sys.stderr)
+            sys.exit(1)
     else:
         print(f"Ingesting newest alerts from file: {args.file} (limit: {args.last})...")
-        count = client.ingest_from_file(args.file, limit=args.last)
+        try:
+            count = client.ingest_from_file(args.file, limit=args.last)
+        except Exception as e:
+            print(f"[Error] Failed to ingest alerts from file {args.file}: {e}", file=sys.stderr)
+            sys.exit(1)
 
     total_in_db = client.db.count()
     print(f"✔ Ingested {count} new alert(s) ({total_in_db} total in database)")
