@@ -380,8 +380,8 @@ def test_dedup_canonical_payload_sort_keys():
     assert alert_a.content_hash() == alert_b.content_hash()
 
 
-def test_database_v1_to_v2_migration(tmp_path):
-    """A legacy v1 database (without schema_version table) is migrated to v2 and rehashed."""
+def test_database_v1_to_v3_migration(tmp_path):
+    """A legacy v1 database (without schema_version table) is migrated to v3 and rehashed."""
     db_file = tmp_path / "legacy_v1.db"
 
     with sqlite3.connect(db_file) as conn:
@@ -416,11 +416,11 @@ def test_database_v1_to_v2_migration(tmp_path):
         )
         conn.commit()
 
-    # Open with AlertDatabase -> must trigger migration to schema version 2
+    # Open with AlertDatabase -> must trigger migration to schema version 3
     client = WazuhClient(str(db_file))
-    assert client.db.get_schema_version() == 2
+    assert client.db.get_schema_version() == 3
 
-    # The row in DB should now have the canonical v2 hash
+    # The row in DB should now have the canonical v3 hash
     with client.db._get_connection() as conn:
         row = conn.cursor().execute("SELECT content_hash FROM alerts WHERE id = 1").fetchone()
         assert row[0] != "legacy_old_hash_12345"
@@ -431,6 +431,59 @@ def test_database_v1_to_v2_migration(tmp_path):
     inserted = client.ingest_from_file(str(sample_file))
     assert inserted == 0
     assert client.db.count() == 1
+
+
+def test_database_v2_to_v3_migration(tmp_path):
+    """An existing v2 database upgrades to v3, canonicalizes timestamps and adds mitre_tactic_names."""
+    db_file = tmp_path / "legacy_v2.db"
+
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)")
+        conn.execute("""
+            CREATE TABLE alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_hash TEXT NOT NULL UNIQUE,
+                timestamp TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                rule_level INTEGER NOT NULL,
+                rule_description TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                src_ip TEXT,
+                dst_ip TEXT,
+                user TEXT,
+                process TEXT,
+                mitre_tactics TEXT,
+                raw_payload TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        v2_payload = json.dumps({
+            "timestamp": "2026-10-05T10:14:01.120+0000",
+            "rule": {
+                "id": "5710",
+                "level": 5,
+                "description": "sshd: login attempt",
+                "mitre": {"id": ["T1110.001"], "tactic": ["Credential Access"]}
+            },
+            "agent": {"name": "web01"}
+        })
+        conn.execute(
+            "INSERT INTO alerts (content_hash, timestamp, rule_id, rule_level, rule_description, agent_name, raw_payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("v2_hash_abcdef", "2026-10-05T10:14:01.120+0000", "5710", 5, "sshd: login attempt", "web01", v2_payload)
+        )
+        conn.commit()
+
+    client = WazuhClient(str(db_file))
+    assert client.db.get_schema_version() == 3
+
+    with client.db._get_connection() as conn:
+        row = conn.cursor().execute("SELECT timestamp, mitre_tactic_names, content_hash FROM alerts WHERE id = 1").fetchone()
+        assert row[0].endswith("Z")
+        assert "2026-10-05T10:14:01" in row[0]
+        assert "Credential Access" in row[1]
+        assert row[2] != "v2_hash_abcdef"
 
 
 def test_ingest_from_indexer_ascending_and_checkpoint(tmp_path):
@@ -583,4 +636,47 @@ def test_fetch_agent_inventory_success_and_auth_error(tmp_path):
         assert len(agents) == 2
         assert agents[0]["name"] == "web01"
         assert agents[1]["name"] == "db01"
+
+
+def test_ingest_from_file_json_array(tmp_path):
+    """Ingestion supports standard JSON arrays as well as line-delimited JSONL."""
+    db_file = tmp_path / "array_test.db"
+    sample_file = tmp_path / "alerts_array.json"
+
+    data = [
+        {
+            "timestamp": "2026-10-05T10:00:00.000Z",
+            "rule": {"id": "5710", "level": 5, "description": "Alert 1"},
+            "agent": {"name": "web01"}
+        },
+        {
+            "timestamp": "2026-10-05T10:00:01.000Z",
+            "rule": {"id": "5712", "level": 10, "description": "Alert 2"},
+            "agent": {"name": "web01"}
+        }
+    ]
+    sample_file.write_text(json.dumps(data), encoding="utf-8")
+
+    client = WazuhClient(str(db_file))
+    count = client.ingest_from_file(str(sample_file))
+    assert count == 2
+    assert client.db.count() == 2
+
+
+def test_fetch_agent_inventory_missing_token_raises(tmp_path):
+    """fetch_agent_inventory raises ConnectionError if auth succeeded without token."""
+    client = WazuhClient(str(tmp_path / "client.db"))
+
+    token_resp = MagicMock()
+    token_resp.read.return_value = json.dumps({"data": {}}).encode("utf-8")
+    token_resp.__enter__.return_value = token_resp
+
+    with patch("urllib.request.urlopen", return_value=token_resp):
+        with pytest.raises(ConnectionError, match="no JWT token returned"):
+            client.fetch_agent_inventory(
+                api_url="https://localhost:55000",
+                user="wazuh-wui",
+                password="test_password",
+                verify_ssl=False
+            )
 

@@ -242,5 +242,5 @@ class TestRiskScoringEngine:
         assert mult == 2.0
 
         tier, mult = engine.get_asset_context("generic-worker")
-        assert tier == "medium"
-        assert mult == 1.5
+        assert tier == "low"
+        assert mult == 1.0

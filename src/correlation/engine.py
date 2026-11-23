@@ -91,6 +91,8 @@ class CorrelatedIncident:
     mitre_techniques: List[str]     # All distinct technique IDs observed
     rule_ids: List[str]             # All distinct rule IDs in the group
     representative_description: str # Description from the highest-severity alert
+    representative_rule_id: str = "" # Rule ID from the highest-severity alert
+    mitre_tactic_names: List[str] = field(default_factory=list) # All observed tactic names
 
     @property
     def group_key(self) -> str:
@@ -109,54 +111,67 @@ def _make_group_key(alert: Dict[str, Any]) -> tuple:
     Returns (src_ip_or_LOCAL, agent_name, technique_family).
     """
     src = alert.get("src_ip") or "LOCAL"
-    agent = alert["agent_name"]
-    techniques = alert.get("mitre_tactics", [])
-    family = extract_technique_family(techniques, alert["rule_id"])
+    agent = alert.get("agent_name", "unknown")
+    techniques = alert.get("mitre_tactics") or []
+    family = extract_technique_family(techniques, str(alert.get("rule_id", "0")))
     return (src, agent, family)
 
 
 def _new_cluster(alert: Dict[str, Any], ts: datetime, family: str) -> dict:
     """Initialize a new cluster state dict from the first alert."""
-    techniques = alert.get("mitre_tactics", [])
+    techniques = alert.get("mitre_tactics") or []
+    tactic_names = alert.get("mitre_tactic_names") or []
+    rule_id = str(alert.get("rule_id", "0"))
+    rule_level = int(alert.get("rule_level", 0))
+    desc = alert.get("rule_description", "")
     return {
         "src_ip": alert.get("src_ip"),
-        "agent_name": alert["agent_name"],
+        "agent_name": alert.get("agent_name", "unknown"),
         "technique_family": family,
-        "first_seen": alert["timestamp"],
-        "last_seen": alert["timestamp"],
+        "first_seen": alert.get("timestamp", ""),
+        "last_seen": alert.get("timestamp", ""),
         "first_dt": ts,
         "last_dt": ts,
-        "alert_ids": [alert["id"]],
+        "alert_ids": [alert.get("id", 0)],
         "alert_count": 1,
-        "max_severity": alert["rule_level"],
-        "representative_description": alert["rule_description"],
+        "max_severity": rule_level,
+        "representative_description": desc,
+        "representative_rule_id": rule_id,
         "mitre_techniques": list(techniques),
-        "rule_ids": [alert["rule_id"]],
+        "mitre_tactic_names": list(tactic_names),
+        "rule_ids": [rule_id],
     }
 
 
 def _extend_cluster(cluster: dict, alert: Dict[str, Any], ts: datetime) -> None:
     """Add an alert to an existing cluster, updating all aggregates."""
     cluster["last_dt"] = ts
-    cluster["last_seen"] = alert["timestamp"]
-    cluster["alert_ids"].append(alert["id"])
+    cluster["last_seen"] = alert.get("timestamp", cluster["last_seen"])
+    cluster["alert_ids"].append(alert.get("id", 0))
     cluster["alert_count"] += 1
 
-    if alert["rule_level"] > cluster["max_severity"]:
-        cluster["max_severity"] = alert["rule_level"]
-        cluster["representative_description"] = alert["rule_description"]
+    rule_level = int(alert.get("rule_level", 0))
+    if rule_level > cluster["max_severity"]:
+        cluster["max_severity"] = rule_level
+        cluster["representative_description"] = alert.get("rule_description", cluster["representative_description"])
+        cluster["representative_rule_id"] = str(alert.get("rule_id", cluster["representative_rule_id"]))
 
-    for t in alert.get("mitre_tactics", []):
+    for t in alert.get("mitre_tactics") or []:
         if t not in cluster["mitre_techniques"]:
             cluster["mitre_techniques"].append(t)
 
-    rid = alert["rule_id"]
+    for tac in alert.get("mitre_tactic_names") or []:
+        if tac not in cluster["mitre_tactic_names"]:
+            cluster["mitre_tactic_names"].append(tac)
+
+    rid = str(alert.get("rule_id", "0"))
     if rid not in cluster["rule_ids"]:
         cluster["rule_ids"].append(rid)
 
 
 def _finalize_cluster(cluster: dict) -> CorrelatedIncident:
     """Convert internal cluster state dict into a CorrelatedIncident."""
+    rep_rule = cluster.get("representative_rule_id") or (cluster["rule_ids"][0] if cluster["rule_ids"] else "")
     return CorrelatedIncident(
         src_ip=cluster["src_ip"],
         agent_name=cluster["agent_name"],
@@ -169,6 +184,8 @@ def _finalize_cluster(cluster: dict) -> CorrelatedIncident:
         mitre_techniques=cluster["mitre_techniques"],
         rule_ids=cluster["rule_ids"],
         representative_description=cluster["representative_description"],
+        representative_rule_id=rep_rule,
+        mitre_tactic_names=cluster.get("mitre_tactic_names", []),
     )
 
 
@@ -200,7 +217,16 @@ def correlate_alerts(
 
     valid_alerts = []
     for alert in alerts:
+        if not isinstance(alert, dict):
+            logger.warning(f"Skipping non-dict alert in correlate_alerts: {alert}")
+            continue
         ts_str = alert.get("timestamp")
+        if not ts_str:
+            logger.warning(f"Skipping alert missing timestamp: {alert}")
+            continue
+        if "agent_name" not in alert or "rule_id" not in alert:
+            logger.warning(f"Skipping malformed alert missing required keys (agent_name or rule_id): {alert}")
+            continue
         try:
             ts = parse_timestamp(ts_str)
             valid_alerts.append((ts, alert))

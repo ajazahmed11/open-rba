@@ -171,7 +171,7 @@ class RiskScoringEngine:
         if tokens & high_tokens:
             return "high", float(self.asset_tiers.get("high", 2.0))
 
-        return "medium", self.default_criticality
+        return "low", self.default_criticality
 
     def register_agent_inventory(self, agents: List[Dict[str, Any]]) -> int:
         """Dynamically registers hosts discovered from Wazuh agent inventory into asset classification.
@@ -288,10 +288,12 @@ class RiskScoringEngine:
         scored = []
         for inc in incidents:
             cti = cti_client.lookup_ip(inc.src_ip, alert_timestamp=inc.last_seen)
+            rep_rule = getattr(inc, "representative_rule_id", None) or (inc.rule_ids[0] if inc.rule_ids else "")
             attack = attack_mapper.evaluate_incident(
                 techniques=inc.mitre_techniques,
                 rule_description=inc.representative_description,
-                rule_id=inc.rule_ids[0] if inc.rule_ids else ""
+                rule_id=rep_rule,
+                tactic_names=getattr(inc, "mitre_tactic_names", None)
             )
             scored.append(self.score_incident(inc, cti, attack))
 

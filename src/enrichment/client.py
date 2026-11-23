@@ -1,7 +1,7 @@
 """
 Threat Intelligence Enrichment Client for Open-RBA (Module 3).
 
-Queries threat intelligence sources (AbuseIPDB, AlienVault OTX) with local
+Queries threat intelligence sources (AbuseIPDB) with local
 SQLite caching, TTL enforcement, and exponential temporal decay:
     CTI_decayed = CTI_normalized * exp(-lambda * delta_t)
 

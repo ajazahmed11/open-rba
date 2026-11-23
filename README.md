@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/pytest-88%2F88%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/pytest-95%2F95%20passing-brightgreen.svg)](tests/)
 [![SIEM](https://img.shields.io/badge/SIEM-Wazuh%20Compatible-orange.svg)](https://wazuh.com/)
 
 ---
@@ -121,7 +121,7 @@ open-rba/
 │   ├── attck/          # Module 4: MITRE ATT&CK tactical progression mapper
 │   ├── scoring/        # Module 5: Dynamic risk scoring & entity aggregation
 │   └── pipeline.py     # End-to-end analytical pipeline CLI
-└── tests/              # Pytest test suite (88 unit and integration tests)
+└── tests/              # Pytest test suite (95 unit and integration tests)
 ```
 
 ---
@@ -168,7 +168,7 @@ python -m src.ingestion.wazuh_client --indexer https://localhost:9200 --insecure
 ```bash
 pytest tests/ -v
 ```
-*(All 88 unit and integration tests execute in <0.4s)*
+*(All 95 unit and integration tests execute in <0.4s)*
 
 ---
 

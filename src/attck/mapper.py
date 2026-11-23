@@ -69,6 +69,7 @@ TECHNIQUE_MAP: Dict[str, Tuple[str, str]] = {
     "T1068": ("Privilege Escalation", "Exploitation for Privilege Escalation"),
     "T1070": ("Defense Evasion", "Indicator Removal"),
     "T1562": ("Defense Evasion", "Impair Defenses"),
+    "T1014": ("Defense Evasion", "Rootkit"),
     "T1110": ("Credential Access", "Brute Force"),
     "T1003": ("Credential Access", "OS Credential Dumping"),
     "T1021": ("Lateral Movement", "Remote Services"),
@@ -102,12 +103,13 @@ class ATTACKMapper:
         self,
         techniques: List[str],
         rule_description: str = "",
-        rule_id: str = ""
+        rule_id: str = "",
+        tactic_names: Optional[List[str]] = None
     ) -> ATTACKProfile:
         """
         Determines the highest tactical criticality reached by an incident.
         If explicit techniques are provided, evaluates their tactics.
-        Otherwise, infers tactical category from rule description or ID.
+        Otherwise, checks explicit tactic names from alerts before falling back to heuristics.
         """
         candidates: List[Tuple[str, str, int, bool]] = []
 
@@ -119,7 +121,16 @@ class ATTACKMapper:
                 stage = self.tactic_stages.get(tactic_name, 1)
                 candidates.append((base_tech, tactic_name, stage, False))
 
-        # 2. Heuristic inference fallback if no known technique matched
+        # 2. Evaluate explicit tactic names from Wazuh alerts (rule.mitre.tactic)
+        if not candidates and tactic_names:
+            for tac in tactic_names:
+                tac_clean = tac.strip().title()
+                if tac_clean in self.tactic_stages:
+                    stage = self.tactic_stages[tac_clean]
+                    tech_id = f"rule:{rule_id}" if rule_id else "UNKNOWN"
+                    candidates.append((tech_id, tac_clean, stage, False))
+
+        # 3. Heuristic inference fallback if no known technique or tactic matched
         if not candidates:
             inferred_tech, inferred_tactic = self._infer_from_rule(rule_description, rule_id)
             stage = self.tactic_stages.get(inferred_tactic, 1)

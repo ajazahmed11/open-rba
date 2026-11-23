@@ -102,3 +102,22 @@ class TestATTACKMapper:
         prof3 = mapper.evaluate_incident([], "Backdoor process listening on unauthorized port", "510")
         assert prof3.primary_tactic == "Defense Evasion"
         assert prof3.stage_depth == 7
+
+    def test_explicit_technique_t1014_rootkit(self, mapper):
+        prof = mapper.evaluate_incident(techniques=["T1014"])
+        assert prof.primary_technique == "T1014"
+        assert prof.primary_tactic == "Defense Evasion"
+        assert prof.stage_depth == 7
+        assert prof.inferred is False
+
+    def test_tactic_names_resolution_from_wazuh_alerts(self, mapper):
+        # When technique ID is unmapped or missing, rule.mitre.tactic resolves before regex
+        prof = mapper.evaluate_incident(
+            techniques=["T9999_UNMAPPED"],
+            rule_description="custom security tool alert",
+            rule_id="9999",
+            tactic_names=["Persistence"]
+        )
+        assert prof.primary_tactic == "Persistence"
+        assert prof.stage_depth == 6
+        assert prof.inferred is False

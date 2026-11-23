@@ -243,6 +243,31 @@ class TestCorrelateAlerts:
         assert result[0].alert_count == 1
         assert result[0].alert_ids == [1]
 
+    def test_correlate_alerts_guards_malformed_dicts(self):
+        """Non-dict items or dicts missing agent_name/rule_id/timestamp are safely ignored."""
+        alerts = [
+            "not a dict",
+            None,
+            {"timestamp": "2026-10-05T10:00:00.000Z"},  # missing agent_name and rule_id
+            {"timestamp": "2026-10-05T10:00:01.000Z", "agent_name": "web01"},  # missing rule_id
+            _alert(1, "2026-10-05T10:00:02.000Z", "5710", 5, "Valid", "web01", src_ip="1.2.3.4")
+        ]
+        result = correlate_alerts(alerts)
+        assert len(result) == 1
+        assert result[0].alert_ids == [1]
+
+    def test_correlate_alerts_tracks_highest_severity_rule_id(self):
+        """Incident tracks representative_rule_id from the alert with the highest severity."""
+        alerts = [
+            _alert(1, "2026-10-05T10:00:00.000Z", "5710", 5, "Failed login", "web01", src_ip="1.2.3.4", mitre_tactics=["T1110.001"]),
+            _alert(2, "2026-10-05T10:00:01.000Z", "5712", 12, "Brute force rootkit", "web01", src_ip="1.2.3.4", mitre_tactics=["T1110.001"]),
+            _alert(3, "2026-10-05T10:00:02.000Z", "5710", 5, "Failed login", "web01", src_ip="1.2.3.4", mitre_tactics=["T1110.001"]),
+        ]
+        result = correlate_alerts(alerts)
+        assert len(result) == 1
+        assert result[0].representative_rule_id == "5712"
+        assert result[0].max_severity == 12
+
 
 class TestFullSampleData:
     """Test against the actual 8-alert sample dataset structure."""

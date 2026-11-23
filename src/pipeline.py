@@ -201,7 +201,8 @@ def main():
     target_file = None
     if not args.no_ingest:
         if args.demo:
-            default_sample = "data/sample_alerts.json"
+            base_dir = Path(__file__).parent.parent
+            default_sample = str(base_dir / "data" / "sample_alerts.json")
             if Path(default_sample).exists():
                 target_file = default_sample
                 print(f"[Notice] Demo mode: Loading bundled sample alerts from {default_sample}...")

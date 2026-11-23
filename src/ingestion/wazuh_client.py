@@ -54,8 +54,9 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
         process = data_block.get("process") or raw.get("program_name")
         full_log = raw.get("full_log")
 
-        # Extract MITRE ATT&CK technique IDs
+        # Extract MITRE ATT&CK technique IDs and tactic names
         mitre_tactics = []
+        mitre_tactic_names = []
         mitre_block = rule_block.get("mitre", {})
         if isinstance(mitre_block, dict):
             raw_ids = mitre_block.get("id", [])
@@ -64,14 +65,21 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
             elif isinstance(raw_ids, str):
                 mitre_tactics = [raw_ids]
 
-        # Validate required timestamp
+            raw_tactics = mitre_block.get("tactic", [])
+            if isinstance(raw_tactics, list):
+                mitre_tactic_names = [str(t) for t in raw_tactics]
+            elif isinstance(raw_tactics, str):
+                mitre_tactic_names = [raw_tactics]
+
+        # Validate required timestamp and canonicalize to UTC ISO-8601
         timestamp = raw.get("timestamp")
         if not timestamp or not isinstance(timestamp, str) or not timestamp.strip():
             logger.warning("Alert missing valid ISO-8601 timestamp")
             return None
         try:
             from src.correlation.engine import parse_timestamp
-            parse_timestamp(timestamp)
+            dt = parse_timestamp(timestamp)
+            canonical_ts = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:23] + "Z"
         except Exception as e:
             logger.warning(f"Alert has unparseable ISO-8601 timestamp {timestamp!r}: {e}")
             return None
@@ -79,7 +87,7 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
         raw_json_str = json.dumps(raw, sort_keys=True)
 
         return NormalizedAlert(
-            timestamp=timestamp,
+            timestamp=canonical_ts,
             rule_id=rule_id,
             rule_level=rule_level,
             rule_description=rule_desc,
@@ -90,7 +98,8 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
             process=process,
             mitre_tactics=mitre_tactics,
             raw_payload=raw_json_str,
-            full_log=full_log
+            full_log=full_log,
+            mitre_tactic_names=mitre_tactic_names
         )
     except Exception as e:
         logger.warning(f"Failed to normalize alert: {e}")
@@ -104,8 +113,8 @@ class WazuhClient:
         self.db = AlertDatabase(db_path)
 
     def ingest_from_file(self, file_path: str, limit: Optional[int] = None) -> int:
-        """Reads a JSONL file (such as alerts.json) and inserts normalized rows.
-        When limit is specified, reads the most recent N lines (tailing the file).
+        """Reads a JSONL or JSON array file (such as alerts.json) and inserts normalized rows.
+        When limit is specified, reads the most recent N lines/objects (tailing the file).
         Duplicates are skipped via content_hash deduplication."""
         path = Path(file_path)
         if not path.exists():
@@ -113,11 +122,38 @@ class WazuhClient:
 
         alerts: List[NormalizedAlert] = []
         with open(path, "r", encoding="utf-8") as f:
-            if limit:
-                # Tail the newest `limit` lines from the log file
-                lines = deque(f, maxlen=limit)
-            else:
-                lines = f.readlines()
+            content = f.read().strip()
+
+        if not content:
+            return 0
+
+        # Handle standard JSON array format: [ {...}, {...} ]
+        if content.startswith("[") and content.endswith("]"):
+            try:
+                data_list = json.loads(content)
+                if isinstance(data_list, list):
+                    if limit:
+                        data_list = data_list[-limit:]
+                    for item in data_list:
+                        if isinstance(item, dict):
+                            norm = normalize_wazuh_alert(item)
+                            if norm:
+                                alerts.append(norm)
+                            else:
+                                self.db.record_dead_letter(
+                                    json.dumps(item, sort_keys=True),
+                                    "NormalizationError: Malformed schema or invalid timestamp/rule level"
+                                )
+                        else:
+                            self.db.record_dead_letter(str(item), "NormalizationError: Non-dict item in JSON array")
+                    return self.db.insert_batch(alerts)
+            except json.JSONDecodeError:
+                pass  # Fall through to line-by-line JSONL parser
+
+        # Handle standard line-by-line JSONL format
+        lines = content.splitlines()
+        if limit:
+            lines = lines[-limit:]
 
         for line in lines:
             line = line.strip()
@@ -182,7 +218,7 @@ class WazuhClient:
         checkpoint = self.db.get_checkpoint(checkpoint_key)
 
         if checkpoint:
-            query_filter = {"range": {"timestamp": {"gt": checkpoint}}}
+            query_filter = {"range": {"timestamp": {"gte": checkpoint}}}
         else:
             query_filter = {"match_all": {}}
 
@@ -289,6 +325,9 @@ class WazuhClient:
                 jwt_token = token_data.get("data", {}).get("token")
         except Exception as e:
             raise ConnectionError(f"Wazuh API authentication failed: {e}")
+
+        if not jwt_token:
+            raise ConnectionError("Wazuh API authentication succeeded but no JWT token returned")
 
         # Fetch agents list
         agents_url = f"{api_url.rstrip('/')}/agents?limit=500"
