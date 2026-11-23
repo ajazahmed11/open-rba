@@ -40,25 +40,21 @@ def parse_timestamp(ts: Optional[str]) -> datetime:
     preventing TypeError on offset-naive and offset-aware comparisons.
     """
     if not ts or not isinstance(ts, str) or not ts.strip():
-        return datetime.now(timezone.utc)
+        raise ValueError(f"Invalid or empty timestamp string: {ts!r}")
 
     ts_clean = ts.strip()
-    try:
-        # Normalize bare 4-digit timezone offset (+0000 -> +00:00)
-        ts_clean = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', ts_clean)
-        # Normalize trailing Z to +00:00
-        if ts_clean.endswith("Z"):
-            ts_clean = ts_clean[:-1] + "+00:00"
+    # Normalize bare 4-digit timezone offset (+0000 -> +00:00)
+    ts_clean = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', ts_clean)
+    # Normalize trailing Z to +00:00
+    if ts_clean.endswith("Z"):
+        ts_clean = ts_clean[:-1] + "+00:00"
 
-        dt = datetime.fromisoformat(ts_clean)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
-        return dt
-    except Exception as e:
-        logger.warning(f"Failed to parse timestamp '{ts}': {e}. Using current UTC time.")
-        return datetime.now(timezone.utc)
+    dt = datetime.fromisoformat(ts_clean)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 
 def extract_technique_family(mitre_techniques: List[str], rule_id: str) -> str:

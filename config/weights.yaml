@@ -10,7 +10,6 @@ temporal_decay:
 
 correlation:
   time_window_seconds: 120   # Window for grouping related alert bursts
-  burst_threshold: 5         # Minimum alerts to trigger incident compression
 
 assets:
   default_criticality: 1.0

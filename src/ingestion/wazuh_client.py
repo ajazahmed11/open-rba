@@ -64,7 +64,12 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
             elif isinstance(raw_ids, str):
                 mitre_tactics = [raw_ids]
 
-        timestamp = raw.get("timestamp", "")
+        # Validate required timestamp
+        timestamp = raw.get("timestamp")
+        if not timestamp or not isinstance(timestamp, str) or not timestamp.strip():
+            logger.warning("Alert missing valid ISO-8601 timestamp")
+            return None
+
         raw_json_str = json.dumps(raw)
 
         return NormalizedAlert(
@@ -130,21 +135,31 @@ class WazuhClient:
         self,
         indexer_url: str = "https://localhost:9200",
         index_pattern: str = "wazuh-alerts-*",
-        user: str = "admin",
-        password: str = "admin",
+        user: Optional[str] = None,
+        password: Optional[str] = None,
         verify_ssl: Optional[bool] = None,
         limit: int = 100
     ) -> int:
         """
         Queries Wazuh Indexer (OpenSearch / Elasticsearch) on port :9200
         where historical security alerts are actually stored and indexed.
+        Supports time checkpointing and secure credential management.
         """
         import urllib.request
         import ssl
         import base64
 
+        auth_user = user or os.getenv("WAZUH_INDEXER_USER")
+        auth_pass = password or os.getenv("WAZUH_INDEXER_PASSWORD")
+        if not auth_user or not auth_pass:
+            raise ValueError(
+                "Wazuh Indexer credentials required. Set WAZUH_INDEXER_USER and "
+                "WAZUH_INDEXER_PASSWORD or pass user/password parameters."
+            )
+
         if verify_ssl is None:
-            verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+            # Default verify_ssl to True for security unless explicitly set to false
+            verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "true").lower() in ("true", "1", "yes")
 
         search_url = f"{indexer_url.rstrip('/')}/{index_pattern}/_search"
         ctx = ssl.create_default_context()
@@ -152,13 +167,24 @@ class WazuhClient:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
-        cred_bytes = f"{user}:{password}".encode("utf-8")
+        cred_bytes = f"{auth_user}:{auth_pass}".encode("utf-8")
         auth_header = f"Basic {base64.b64encode(cred_bytes).decode('utf-8')}"
+
+        # Incremental checkpointing: query alerts newer than last recorded checkpoint
+        checkpoint = self.db.get_checkpoint("indexer")
+        if not checkpoint:
+            recent = self.db.fetch_recent(limit=1)
+            checkpoint = recent[0].get("timestamp") if recent else None
+
+        if checkpoint:
+            query_filter = {"range": {"timestamp": {"gt": checkpoint}}}
+        else:
+            query_filter = {"match_all": {}}
 
         query_payload = json.dumps({
             "size": limit,
             "sort": [{"timestamp": {"order": "desc"}}],
-            "query": {"match_all": {}}
+            "query": query_filter
         }).encode("utf-8")
 
         req = urllib.request.Request(
@@ -176,44 +202,53 @@ class WazuhClient:
             raise ConnectionError(f"Wazuh Indexer query failed: {e}")
 
         alerts: List[NormalizedAlert] = []
+        max_ts = checkpoint
         for hit in hits:
             source = hit.get("_source", {})
             norm = normalize_wazuh_alert(source)
             if norm:
                 alerts.append(norm)
+                if not max_ts or norm.timestamp > max_ts:
+                    max_ts = norm.timestamp
             else:
                 self.db.record_dead_letter(json.dumps(source), "NormalizationError: Malformed indexer alert schema")
 
+        if max_ts:
+            self.db.set_checkpoint("indexer", max_ts)
+
         return self.db.insert_batch(alerts)
 
-    def ingest_from_api(
+    def fetch_agent_inventory(
         self,
-        api_url: str,
-        user: str,
-        password: str,
-        verify_ssl: Optional[bool] = None,
-        limit: int = 100
-    ) -> int:
+        api_url: str = "https://localhost:55000",
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        verify_ssl: Optional[bool] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Connects to Wazuh REST API (:55000).
-        Note: Wazuh 4.x+ REST API manages agents and configurations; security alerts
-        are indexed directly in the Wazuh Indexer (:9200) or logged to alerts.json.
+        Retrieves agent inventory metadata from Wazuh management API (:55000)
+        to assist in dynamic asset tier categorization.
         """
         import urllib.request
         import ssl
         import base64
 
-        if verify_ssl is None:
-            verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+        auth_user = user or os.getenv("WAZUH_API_USER", "wazuh-wui")
+        auth_pass = password or os.getenv("WAZUH_API_PASSWORD")
+        if not auth_pass:
+            raise ValueError("WAZUH_API_PASSWORD required for management API access")
 
-        # Step 1: Authenticate and get JWT token
-        auth_url = f"{api_url.rstrip('/')}/security/user/authenticate"
+        if verify_ssl is None:
+            verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "true").lower() in ("true", "1", "yes")
+
         ctx = ssl.create_default_context()
         if not verify_ssl:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
-        cred_bytes = f"{user}:{password}".encode("utf-8")
+        # Authenticate with Wazuh management API
+        auth_url = f"{api_url.rstrip('/')}/security/user/authenticate"
+        cred_bytes = f"{auth_user}:{auth_pass}".encode("utf-8")
         auth_header = f"Basic {base64.b64encode(cred_bytes).decode('utf-8')}"
 
         req = urllib.request.Request(
@@ -229,37 +264,20 @@ class WazuhClient:
         except Exception as e:
             raise ConnectionError(f"Wazuh API authentication failed: {e}")
 
-        if not jwt_token:
-            raise ConnectionError("Wazuh API returned empty JWT token")
-
-        # Step 2: Attempt fetching alerts endpoint (if configured / custom proxy)
-        alerts_url = f"{api_url.rstrip('/')}/alerts?limit={limit}&sort=-timestamp"
-        req_alerts = urllib.request.Request(
-            alerts_url,
+        # Fetch agents list
+        agents_url = f"{api_url.rstrip('/')}/agents?limit=500"
+        req_agents = urllib.request.Request(
+            agents_url,
             method="GET",
             headers={"Authorization": f"Bearer {jwt_token}"}
         )
 
         try:
-            with urllib.request.urlopen(req_alerts, context=ctx, timeout=15) as resp:
+            with urllib.request.urlopen(req_agents, context=ctx, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                items = data.get("data", {}).get("affected_items", [])
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                raise NotImplementedError(
-                    "Wazuh REST API on port :55000 does not expose a native /alerts endpoint. "
-                    "Use ingest_from_indexer() to query OpenSearch (:9200/wazuh-alerts-*) or "
-                    "ingest_from_file() to read /var/ossec/logs/alerts/alerts.json."
-                ) from e
-            raise
-
-        alerts: List[NormalizedAlert] = []
-        for item in items:
-            norm = normalize_wazuh_alert(item)
-            if norm:
-                alerts.append(norm)
-
-        return self.db.insert_batch(alerts)
+                return data.get("data", {}).get("affected_items", [])
+        except Exception as e:
+            raise ConnectionError(f"Failed to fetch Wazuh agent inventory: {e}")
 
 
 def main():
@@ -268,8 +286,8 @@ def main():
                         help="Path to JSONL alert log file to ingest")
     parser.add_argument("--indexer", nargs="?", const="default", default=None,
                         help="Ingest alerts from Wazuh OpenSearch Indexer (:9200), optional custom URL")
-    parser.add_argument("--api", nargs="?", const="default", default=None,
-                        help="Ingest alerts from Wazuh REST API (:55000), optional custom URL")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Disable TLS verification for local/testing indexer")
     parser.add_argument("--last", type=int, default=100,
                         help="Maximum number of alerts to ingest/display")
     parser.add_argument("--db", type=str, default="data/alerts.db",
@@ -278,32 +296,16 @@ def main():
     args = parser.parse_args()
     client = WazuhClient(args.db)
 
-    verify_ssl = os.getenv("WAZUH_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
+    verify_ssl = not args.insecure and (os.getenv("WAZUH_VERIFY_SSL", "true").lower() in ("true", "1", "yes"))
 
     if args.indexer is not None:
         idx_url = args.indexer if args.indexer != "default" else os.getenv("WAZUH_INDEXER_URL", "https://localhost:9200")
-        idx_user = os.getenv("WAZUH_INDEXER_USER", "admin")
-        idx_pass = os.getenv("WAZUH_INDEXER_PASSWORD", "admin")
         print(f"Querying Wazuh Indexer at {idx_url} (limit: {args.last})...")
         try:
-            count = client.ingest_from_indexer(idx_url, user=idx_user, password=idx_pass,
-                                               verify_ssl=verify_ssl, limit=args.last)
+            count = client.ingest_from_indexer(idx_url, verify_ssl=verify_ssl, limit=args.last)
         except Exception as e:
             print(f"[Error] Failed to connect to Wazuh Indexer at {idx_url}: {e}", file=sys.stderr)
-            print("        Ensure Wazuh OpenSearch Indexer (:9200) is running or configure WAZUH_INDEXER_URL.", file=sys.stderr)
-            sys.exit(1)
-    elif args.api is not None:
-        api_url = args.api if args.api != "default" else os.getenv("WAZUH_API_URL", "https://localhost:55000")
-        api_user = os.getenv("WAZUH_API_USER", "wazuh-wui")
-        api_pass = os.getenv("WAZUH_API_PASSWORD", "")
-        if not api_pass:
-            print("[Error] WAZUH_API_PASSWORD environment variable not set.", file=sys.stderr)
-            sys.exit(1)
-        print(f"Connecting to Wazuh API at {api_url}...")
-        try:
-            count = client.ingest_from_api(api_url, api_user, api_pass, verify_ssl=verify_ssl, limit=args.last)
-        except Exception as e:
-            print(f"[Error] Failed to connect to Wazuh API at {api_url}: {e}", file=sys.stderr)
+            print("        Ensure WAZUH_INDEXER_USER and WAZUH_INDEXER_PASSWORD are set.", file=sys.stderr)
             sys.exit(1)
     else:
         print(f"Ingesting newest alerts from file: {args.file} (limit: {args.last})...")
@@ -311,6 +313,7 @@ def main():
             count = client.ingest_from_file(args.file, limit=args.last)
         except Exception as e:
             print(f"[Error] Failed to ingest alerts from file {args.file}: {e}", file=sys.stderr)
+            sys.exit(1)
             sys.exit(1)
 
     total_in_db = client.db.count()

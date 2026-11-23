@@ -49,7 +49,8 @@ class OpenRBAPipeline:
         db_path: str = "data/alerts.db",
         weights_config: str = "config/weights.yaml",
         api_key: Optional[str] = None,
-        mock_intel: Optional[Dict[str, Any]] = None
+        mock_intel: Optional[Dict[str, Any]] = None,
+        use_mock_cti: bool = False
     ):
         base_dir = Path(__file__).parent.parent
         resolved_db = db_path if Path(db_path).is_absolute() else str(base_dir / db_path)
@@ -67,7 +68,12 @@ class OpenRBAPipeline:
         max_age_days = int(decay_cfg.get("max_indicator_age_days", 90))
 
         # Configurable mock intelligence for offline testing
-        active_mock_intel = mock_intel if mock_intel is not None else DEFAULT_MOCK_INTEL
+        if mock_intel is not None:
+            active_mock_intel = mock_intel
+        elif use_mock_cti:
+            active_mock_intel = DEFAULT_MOCK_INTEL
+        else:
+            active_mock_intel = {}
 
         self.cti_client = ThreatIntelClient(
             api_key=api_key or os.getenv("ABUSEIPDB_API_KEY"),
@@ -175,6 +181,10 @@ def main():
     parser = argparse.ArgumentParser(description="Open-RBA Prioritization Pipeline")
     parser.add_argument("--file", type=str, default=None,
                         help="Path to JSON alert file to ingest and prioritize (optional)")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run in demo mode with bundled sample alerts and mock CTI")
+    parser.add_argument("--mock-cti", action="store_true",
+                        help="Enable offline mock CTI indicators")
     parser.add_argument("--db", type=str, default="data/alerts.db",
                         help="Target SQLite alerts database")
     parser.add_argument("--weights", type=str, default="config/weights.yaml",
@@ -185,16 +195,20 @@ def main():
                         help="Skip file ingestion and score existing alerts in the database")
 
     args = parser.parse_args()
-    pipeline = OpenRBAPipeline(db_path=args.db, weights_config=args.weights)
+    use_mock = args.mock_cti or args.demo
+    pipeline = OpenRBAPipeline(db_path=args.db, weights_config=args.weights, use_mock_cti=use_mock)
 
     target_file = None
     if not args.no_ingest:
-        if args.file:
-            target_file = args.file
-        elif pipeline.db.count() == 0:
+        if args.demo:
             default_sample = "data/sample_alerts.json"
             if Path(default_sample).exists():
                 target_file = default_sample
+                print(f"[Notice] Demo mode: Loading bundled sample alerts from {default_sample}...")
+        elif args.file:
+            target_file = args.file
+        elif pipeline.db.count() == 0:
+            print("[Notice] Alerts database is empty. Use '--demo' or '--file <path>' to ingest alerts.")
 
     results = pipeline.run(file_path=target_file, limit=args.limit)
     print(format_table(results))

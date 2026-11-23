@@ -101,23 +101,25 @@ class RiskScoringEngine:
         self.w_cti = w_cti / total_w
         self.w_kc = w_kc / total_w
 
-        # Asset mappings
+        # Asset mappings: ensure host keys and values are strictly lowercased
         asset_cfg = self.config.get("assets", {})
         self.asset_tiers = asset_cfg.get("tiers", {"critical": 3.0, "high": 2.0, "medium": 1.5, "low": 1.0})
-        self.asset_hosts = asset_cfg.get("hosts", {})
+        self.asset_hosts = {str(k).lower(): str(v).lower() for k, v in asset_cfg.get("hosts", {}).items()}
         self.default_criticality = float(asset_cfg.get("default_criticality", 1.0))
 
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
         if config_path:
             p = Path(config_path)
-            if p.exists():
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        data = yaml.safe_load(f)
-                        if isinstance(data, dict):
-                            return data
-                except Exception:
-                    pass
+            if not p.exists():
+                raise FileNotFoundError(f"Configuration file not found: {config_path}")
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+                    if not isinstance(data, dict):
+                        raise ValueError(f"Configuration in {config_path} must be a YAML mapping")
+                    return data
+            except yaml.YAMLError as e:
+                raise ValueError(f"Invalid YAML in configuration file {config_path}: {e}") from e
         return self.DEFAULT_CONFIG
 
     def get_asset_context(self, agent_name: str) -> tuple[str, float]:

@@ -31,15 +31,26 @@ class NormalizedAlert:
     def content_hash(self) -> str:
         """Deterministic SHA-256 hash of identity fields for deduplication.
 
-        Two alerts are considered duplicates if they share the same timestamp,
-        rule_id, agent_name, src_ip, dst_ip, user, and log content.
+        Incorporates timestamp, rule, agent, network endpoints, user, and
+        full_log or canonical raw_payload to ensure uniqueness.
         """
-        log_key = self.full_log or self.rule_description or ""
+        log_key = self.full_log or self.raw_payload or self.rule_description or ""
         identity = f"{self.timestamp}|{self.rule_id}|{self.agent_name}|{self.src_ip}|{self.dst_ip}|{self.user}|{log_key}"
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 CREATE_ALERTS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER PRIMARY KEY,
+    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    source TEXT PRIMARY KEY,
+    last_timestamp TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     content_hash TEXT NOT NULL UNIQUE,
@@ -88,6 +99,46 @@ class AlertDatabase:
         """Initializes tables and indexing schema idempotently."""
         with self._get_connection() as conn:
             conn.executescript(CREATE_ALERTS_TABLE_SQL)
+            conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (2)")
+            conn.commit()
+
+    def get_schema_version(self) -> int:
+        """Returns the current database schema version."""
+        sql = "SELECT MAX(version) FROM schema_version"
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql)
+                row = cursor.fetchone()
+                return int(row[0]) if row and row[0] is not None else 1
+        except Exception:
+            return 1
+
+    def get_checkpoint(self, source: str) -> Optional[str]:
+        """Retrieves last recorded timestamp for an ingestion source."""
+        sql = "SELECT last_timestamp FROM checkpoints WHERE source = ?"
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, (source,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+        except Exception:
+            return None
+
+    def set_checkpoint(self, source: str, last_timestamp: str) -> None:
+        """Saves last recorded timestamp for an ingestion source."""
+        sql = """
+        INSERT OR REPLACE INTO checkpoints (source, last_timestamp, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, (source, last_timestamp))
+                conn.commit()
+        except Exception:
+            pass
 
     def _alert_to_row(self, alert: NormalizedAlert) -> tuple:
         """Convert a NormalizedAlert to a tuple for SQL insertion."""

@@ -71,6 +71,22 @@ def test_normalize_wazuh_alert_missing_fields():
     assert alert.mitre_tactics == []
 
 
+def test_normalize_wazuh_alert_missing_timestamp():
+    """Alerts without a valid timestamp must be rejected and not silently defaulted."""
+    raw = {
+        "rule": {"id": "5712", "level": 10, "description": "SSH brute force"},
+        "agent": {"name": "web01"}
+    }
+    assert normalize_wazuh_alert(raw) is None
+
+    raw_empty = {
+        "timestamp": "   ",
+        "rule": {"id": "5712", "level": 10, "description": "SSH brute force"},
+        "agent": {"name": "web01"}
+    }
+    assert normalize_wazuh_alert(raw_empty) is None
+
+
 # ---------------------------------------------------------------------------
 # Content hash tests
 # ---------------------------------------------------------------------------

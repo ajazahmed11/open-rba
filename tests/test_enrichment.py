@@ -119,6 +119,7 @@ class TestThreatIntelClient:
         with client.cache._get_connection() as conn:
             conn.cursor().execute(sql)
 
-        # Lookup should detect cache is expired and fallback to unknown/live
+        # When live lookup is unavailable, expired entry is served as cache-stale
         report = client.lookup_ip("198.51.100.5")
-        assert report.source == "unknown"  # Expired cache entry ignored!
+        assert report.source == "cache-stale"
+        assert report.raw_score == 90.0

@@ -98,7 +98,8 @@ Raw Wazuh Alerts (alerts.json / OpenSearch Indexer :9200)
    * **Asset Multiplier:**
      $$R_{incident} = R_{base} \cdot M_{asset}$$
      *(Critical: $3.0\times$, High: $2.0\times$, Medium: $1.5\times$, Low: $1.0\times$)*
-   * **Bounded Entity Risk Rollup:**
+   * **Diminishing-Returns Entity Rollup:**
+     To prevent high-volume routine telemetry from outranking targeted high-impact breaches, entity risk uses rank-decayed diminishing returns:
      $$R_{effective} = R_{(0)} + \sum_{i=1}^{n-1} \frac{R_{(i)}}{1 + \ln(1 + i)}$$
      $$R_{entity} = R_{effective} \cdot \text{Tactics\_Bonus}$$
      *(Tactics bonus: $1.0\times$ for single tactic, $1.3\times$ for two tactics, $1.6\times$ for multi-stage intrusions $\ge 3$ tactics)*

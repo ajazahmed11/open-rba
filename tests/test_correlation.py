@@ -63,10 +63,10 @@ class TestParseTimestamp:
         assert dt.hour == 10
 
     def test_empty_or_none_timestamp_fallback(self):
-        dt_empty = parse_timestamp("")
-        dt_none = parse_timestamp(None)
-        assert dt_empty.tzinfo is not None
-        assert dt_none.tzinfo is not None
+        with pytest.raises(ValueError):
+            parse_timestamp("")
+        with pytest.raises(ValueError):
+            parse_timestamp(None)
 
     def test_mixed_naive_and_aware_correlation(self):
         # Alerts with naive and aware timestamps should not crash with TypeError

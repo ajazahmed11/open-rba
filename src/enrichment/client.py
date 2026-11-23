@@ -257,6 +257,21 @@ class ThreatIntelClient:
                     source="abuseipdb"
                 )
             elif query_status in ("rate_limited", "error"):
+                # If cached entry exists (even expired), serve stale entry on live failure
+                if cached:
+                    norm_score = cached["normalized_score"]
+                    raw_score = cached["raw_score"]
+                    age_days = self._compute_age_days(cached["last_reported_at"], alert_timestamp)
+                    decayed = calculate_temporal_decay(norm_score, age_days, self.lambda_factor, self.max_age_days)
+                    return CTIReport(
+                        ip=ip_clean,
+                        raw_score=raw_score,
+                        normalized_score=norm_score,
+                        decayed_score=decayed,
+                        indicator_age_days=age_days,
+                        is_private=False,
+                        source="cache-stale"
+                    )
                 # Differentiate lookup failure from a clean IP so weight renormalization applies
                 return CTIReport(
                     ip=ip_clean,
@@ -267,6 +282,22 @@ class ThreatIntelClient:
                     is_private=False,
                     source="error"
                 )
+
+        # If API is not configured or offline, but an expired cache record exists, serve it as stale
+        if cached:
+            norm_score = cached["normalized_score"]
+            raw_score = cached["raw_score"]
+            age_days = self._compute_age_days(cached["last_reported_at"], alert_timestamp)
+            decayed = calculate_temporal_decay(norm_score, age_days, self.lambda_factor, self.max_age_days)
+            return CTIReport(
+                ip=ip_clean,
+                raw_score=raw_score,
+                normalized_score=norm_score,
+                decayed_score=decayed,
+                indicator_age_days=age_days,
+                is_private=False,
+                source="cache-stale"
+            )
 
         # Graceful fallback when offline / no key
         return CTIReport(
