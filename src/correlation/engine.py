@@ -198,15 +198,27 @@ def correlate_alerts(
     if not alerts:
         return []
 
-    # Sort by timestamp to process chronologically
-    sorted_alerts = sorted(alerts, key=lambda a: a["timestamp"])
+    valid_alerts = []
+    for alert in alerts:
+        ts_str = alert.get("timestamp")
+        try:
+            ts = parse_timestamp(ts_str)
+            valid_alerts.append((ts, alert))
+        except Exception as e:
+            logger.warning(f"Skipping alert with corrupt or missing timestamp (ID: {alert.get('id')}): {e}")
+            continue
+
+    if not valid_alerts:
+        return []
+
+    # Sort chronologically by parsed UTC timestamp
+    valid_alerts.sort(key=lambda item: item[0])
 
     # Active clusters keyed by (src_ip, agent, technique_family)
     active: Dict[tuple, dict] = {}
     completed: List[CorrelatedIncident] = []
 
-    for alert in sorted_alerts:
-        ts = parse_timestamp(alert["timestamp"])
+    for ts, alert in valid_alerts:
         key = _make_group_key(alert)
         family = key[2]  # technique_family from the tuple
 

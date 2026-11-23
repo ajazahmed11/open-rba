@@ -2,7 +2,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/pytest-73%2F73%20passing-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/pytest-88%2F88%20passing-brightgreen.svg)](tests/)
 [![SIEM](https://img.shields.io/badge/SIEM-Wazuh%20Compatible-orange.svg)](https://wazuh.com/)
 
 ---
@@ -121,7 +121,7 @@ open-rba/
 │   ├── attck/          # Module 4: MITRE ATT&CK tactical progression mapper
 │   ├── scoring/        # Module 5: Dynamic risk scoring & entity aggregation
 │   └── pipeline.py     # End-to-end analytical pipeline CLI
-└── tests/              # Pytest test suite (73 unit and integration tests)
+└── tests/              # Pytest test suite (88 unit and integration tests)
 ```
 
 ---
@@ -142,6 +142,12 @@ pip install -r requirements.txt
 # Ingest alerts, correlate bursts, enrich CTI, map MITRE tactics, and prioritize:
 python -m src.pipeline --file data/sample_alerts.json
 
+# Run bundled demo alerts on empty database:
+python -m src.pipeline --demo
+
+# Enable mock threat intelligence scoring for offline testing / documentation IPs:
+python -m src.pipeline --demo --mock-cti
+
 # Or prioritize existing database records directly:
 python -m src.pipeline --no-ingest
 ```
@@ -153,13 +159,16 @@ python -m src.ingestion.wazuh_client --file data/sample_alerts.json
 
 # Ingest live alerts from Wazuh OpenSearch Indexer (:9200):
 python -m src.ingestion.wazuh_client --indexer https://localhost:9200 --last 100
+
+# Ingest with TLS verification disabled for local self-signed testing certificates:
+python -m src.ingestion.wazuh_client --indexer https://localhost:9200 --insecure
 ```
 
 ### 4. Run the Test Suite
 ```bash
 pytest tests/ -v
 ```
-*(All 73 unit and integration tests execute in <0.3s)*
+*(All 88 unit and integration tests execute in <0.4s)*
 
 ---
 

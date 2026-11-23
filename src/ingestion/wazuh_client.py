@@ -69,8 +69,14 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
         if not timestamp or not isinstance(timestamp, str) or not timestamp.strip():
             logger.warning("Alert missing valid ISO-8601 timestamp")
             return None
+        try:
+            from src.correlation.engine import parse_timestamp
+            parse_timestamp(timestamp)
+        except Exception as e:
+            logger.warning(f"Alert has unparseable ISO-8601 timestamp {timestamp!r}: {e}")
+            return None
 
-        raw_json_str = json.dumps(raw)
+        raw_json_str = json.dumps(raw, sort_keys=True)
 
         return NormalizedAlert(
             timestamp=timestamp,
@@ -138,7 +144,8 @@ class WazuhClient:
         user: Optional[str] = None,
         password: Optional[str] = None,
         verify_ssl: Optional[bool] = None,
-        limit: int = 100
+        limit: int = 100,
+        page_size: int = 100
     ) -> int:
         """
         Queries Wazuh Indexer (OpenSearch / Elasticsearch) on port :9200
@@ -170,53 +177,72 @@ class WazuhClient:
         cred_bytes = f"{auth_user}:{auth_pass}".encode("utf-8")
         auth_header = f"Basic {base64.b64encode(cred_bytes).decode('utf-8')}"
 
-        # Incremental checkpointing: query alerts newer than last recorded checkpoint
-        checkpoint = self.db.get_checkpoint("indexer")
-        if not checkpoint:
-            recent = self.db.fetch_recent(limit=1)
-            checkpoint = recent[0].get("timestamp") if recent else None
+        # Incremental checkpointing keyed per (url, index_pattern)
+        checkpoint_key = f"{indexer_url.rstrip('/')}/{index_pattern}"
+        checkpoint = self.db.get_checkpoint(checkpoint_key)
 
         if checkpoint:
             query_filter = {"range": {"timestamp": {"gt": checkpoint}}}
         else:
             query_filter = {"match_all": {}}
 
-        query_payload = json.dumps({
-            "size": limit,
-            "sort": [{"timestamp": {"order": "desc"}}],
-            "query": query_filter
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            search_url,
-            data=query_payload,
-            method="POST",
-            headers={"Authorization": auth_header, "Content-Type": "application/json"}
-        )
-
-        try:
-            with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                hits = data.get("hits", {}).get("hits", [])
-        except Exception as e:
-            raise ConnectionError(f"Wazuh Indexer query failed: {e}")
-
         alerts: List[NormalizedAlert] = []
         max_ts = checkpoint
-        for hit in hits:
-            source = hit.get("_source", {})
-            norm = normalize_wazuh_alert(source)
-            if norm:
-                alerts.append(norm)
-                if not max_ts or norm.timestamp > max_ts:
-                    max_ts = norm.timestamp
-            else:
-                self.db.record_dead_letter(json.dumps(source), "NormalizationError: Malformed indexer alert schema")
+        total_fetched = 0
+        search_after = None
 
-        if max_ts:
-            self.db.set_checkpoint("indexer", max_ts)
+        while total_fetched < limit:
+            batch_size = min(page_size, limit - total_fetched)
+            query_body: Dict[str, Any] = {
+                "size": batch_size,
+                "sort": [{"timestamp": {"order": "asc"}}, {"_id": {"order": "asc"}}],
+                "query": query_filter
+            }
+            if search_after:
+                query_body["search_after"] = search_after
 
-        return self.db.insert_batch(alerts)
+            query_payload = json.dumps(query_body).encode("utf-8")
+            req = urllib.request.Request(
+                search_url,
+                data=query_payload,
+                method="POST",
+                headers={"Authorization": auth_header, "Content-Type": "application/json"}
+            )
+
+            try:
+                with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    hits = data.get("hits", {}).get("hits", [])
+            except Exception as e:
+                raise ConnectionError(f"Wazuh Indexer query failed: {e}")
+
+            if not hits:
+                break
+
+            for hit in hits:
+                source = hit.get("_source", {})
+                norm = normalize_wazuh_alert(source)
+                if norm:
+                    alerts.append(norm)
+                    if not max_ts or norm.timestamp > max_ts:
+                        max_ts = norm.timestamp
+                else:
+                    self.db.record_dead_letter(
+                        json.dumps(source, sort_keys=True),
+                        "NormalizationError: Malformed indexer alert schema or timestamp"
+                    )
+
+            total_fetched += len(hits)
+            search_after = hits[-1].get("sort")
+            if not search_after or len(hits) < batch_size:
+                break
+
+        # Advance checkpoint only after batch insert completes successfully
+        inserted = self.db.insert_batch(alerts)
+        if max_ts and alerts:
+            self.db.set_checkpoint(checkpoint_key, max_ts)
+
+        return inserted
 
     def fetch_agent_inventory(
         self,
@@ -233,8 +259,8 @@ class WazuhClient:
         import ssl
         import base64
 
-        auth_user = user or os.getenv("WAZUH_API_USER", "wazuh-wui")
-        auth_pass = password or os.getenv("WAZUH_API_PASSWORD")
+        auth_user = user if user is not None else os.getenv("WAZUH_API_USER", "wazuh-wui")
+        auth_pass = password if password is not None else os.getenv("WAZUH_API_PASSWORD")
         if not auth_pass:
             raise ValueError("WAZUH_API_PASSWORD required for management API access")
 
@@ -313,7 +339,6 @@ def main():
             count = client.ingest_from_file(args.file, limit=args.last)
         except Exception as e:
             print(f"[Error] Failed to ingest alerts from file {args.file}: {e}", file=sys.stderr)
-            sys.exit(1)
             sys.exit(1)
 
     total_in_db = client.db.count()

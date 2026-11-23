@@ -191,3 +191,56 @@ class TestRiskScoringEngine:
         # Logarithmic diminishing returns curve strictly bounds the volume storm
         assert entity.total_entity_risk < 7.0
         assert entity.total_entity_risk < entity.raw_incident_risk_sum
+
+    def test_strict_weight_validation_negative(self, tmp_path):
+        bad_config = tmp_path / "bad_weights.yaml"
+        bad_config.write_text("weights:\n  severity: -0.1\n  threat_intel: 0.5\n  kill_chain: 0.6\n")
+        with pytest.raises(ValueError, match="Weights must be non-negative"):
+            RiskScoringEngine(str(bad_config))
+
+    def test_strict_weight_validation_zero_sum(self, tmp_path):
+        zero_config = tmp_path / "zero_weights.yaml"
+        zero_config.write_text("weights:\n  severity: 0.0\n  threat_intel: 0.0\n  kill_chain: 0.0\n")
+        with pytest.raises(ValueError, match="Sum of weights must be positive"):
+            RiskScoringEngine(str(zero_config))
+
+    def test_strict_tier_validation_unknown_tier(self, tmp_path):
+        bad_tier = tmp_path / "bad_tier.yaml"
+        bad_tier.write_text("assets:\n  hosts:\n    badhost: nonexistent_tier\n")
+        with pytest.raises(ValueError, match="unknown asset tier"):
+            RiskScoringEngine(str(bad_tier))
+
+    def test_asset_hierarchy_test_tokens_override_critical(self, engine):
+        # Ephemeral/testing tokens take precedence over critical/high server tokens
+        tier, mult = engine.get_asset_context("test-db01")
+        assert tier == "low"
+        assert mult == 1.0
+
+        tier, mult = engine.get_asset_context("dev-web01")
+        assert tier == "low"
+        assert mult == 1.0
+
+        tier, mult = engine.get_asset_context("staging-dc01")
+        assert tier == "low"
+        assert mult == 1.0
+
+    def test_register_agent_inventory_dynamic_hosts(self, engine):
+        agents = [
+            {"name": "discovered-db", "group": ["databases"]},
+            {"name": "discovered-api", "group": ["web-servers"]},
+            {"name": "generic-worker", "group": ["default"]}
+        ]
+        registered = engine.register_agent_inventory(agents)
+        assert registered == 3
+
+        tier, mult = engine.get_asset_context("discovered-db")
+        assert tier == "critical"
+        assert mult == 3.0
+
+        tier, mult = engine.get_asset_context("discovered-api")
+        assert tier == "high"
+        assert mult == 2.0
+
+        tier, mult = engine.get_asset_context("generic-worker")
+        assert tier == "medium"
+        assert mult == 1.5

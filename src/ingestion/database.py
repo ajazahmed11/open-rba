@@ -34,7 +34,17 @@ class NormalizedAlert:
         Incorporates timestamp, rule, agent, network endpoints, user, and
         full_log or canonical raw_payload to ensure uniqueness.
         """
-        log_key = self.full_log or self.raw_payload or self.rule_description or ""
+        if self.full_log:
+            log_key = self.full_log
+        elif self.raw_payload:
+            try:
+                parsed = json.loads(self.raw_payload)
+                log_key = json.dumps(parsed, sort_keys=True)
+            except Exception:
+                log_key = self.raw_payload
+        else:
+            log_key = self.rule_description or ""
+
         identity = f"{self.timestamp}|{self.rule_id}|{self.agent_name}|{self.src_ip}|{self.dst_ip}|{self.user}|{log_key}"
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
@@ -96,11 +106,73 @@ class AlertDatabase:
         return conn
 
     def init_schema(self) -> None:
-        """Initializes tables and indexing schema idempotently."""
+        """Initializes tables and indexing schema idempotently with automated migration."""
         with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # Detect legacy v1 database: alerts table exists but schema_version does not
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
+            has_version_table = cursor.fetchone() is not None
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'")
+            has_alerts_table = cursor.fetchone() is not None
+
             conn.executescript(CREATE_ALERTS_TABLE_SQL)
-            conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (2)")
+
+            if not has_version_table and has_alerts_table:
+                # Migrate existing v1 alerts by rehashing to v2 canonical hashes
+                self._migrate_v1_to_v2(conn)
+            else:
+                conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (2)")
+
             conn.commit()
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """Migrates legacy v1 database to v2 by re-indexing canonical hashes."""
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, timestamp, rule_id, rule_level, rule_description, "
+            "agent_name, src_ip, dst_ip, user, process, mitre_tactics, raw_payload FROM alerts"
+        )
+        rows = cursor.fetchall()
+        seen_hashes = set()
+        for row in rows:
+            row_id = row[0]
+            raw_payload_str = row[11]
+            full_log = None
+            canonical_payload = raw_payload_str
+            if raw_payload_str:
+                try:
+                    payload_dict = json.loads(raw_payload_str)
+                    full_log = payload_dict.get("full_log")
+                    canonical_payload = json.dumps(payload_dict, sort_keys=True)
+                except Exception:
+                    pass
+
+            norm = NormalizedAlert(
+                timestamp=row[1],
+                rule_id=row[2],
+                rule_level=row[3],
+                rule_description=row[4],
+                agent_name=row[5],
+                src_ip=row[6],
+                dst_ip=row[7],
+                user=row[8],
+                process=row[9],
+                mitre_tactics=json.loads(row[10]) if row[10] else [],
+                raw_payload=canonical_payload,
+                full_log=full_log
+            )
+            new_hash = norm.content_hash()
+            if new_hash in seen_hashes:
+                cursor.execute("DELETE FROM alerts WHERE id = ?", (row_id,))
+            else:
+                seen_hashes.add(new_hash)
+                cursor.execute(
+                    "UPDATE alerts SET content_hash = ?, raw_payload = ? WHERE id = ?",
+                    (new_hash, canonical_payload, row_id)
+                )
+
+        conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (2)")
 
     def get_schema_version(self) -> int:
         """Returns the current database schema version."""

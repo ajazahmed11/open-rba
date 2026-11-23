@@ -144,8 +144,12 @@ class ATTACKMapper:
         """Strict word-boundary heuristic pattern matching for alerts lacking MITRE tags."""
         desc = description.lower()
 
+        # Guard against negative findings and clean scan completions
+        if re.search(r'\b(no|0|zero|clean)\s+(findings?|malware|rootkits?|threats?)\b|\bscan\s+completed\s+with\s+0\b|\b(0|zero)\s+findings\b', desc):
+            return "T1082", "Discovery"
+
         # Check specific threats like rootkit or trojan before routine scan keywords
-        if re.search(r'\b(rootkit|trojan|backdoor|malware)\b', desc):
+        if re.search(r'\b(rootkits?|trojans?|trojaned|backdoors?|malware)\b', desc):
             return "T1014", "Defense Evasion"
 
         # Guard against routine scan completions

@@ -228,6 +228,21 @@ class TestCorrelateAlerts:
         assert result[0].max_severity == 10
         assert result[0].representative_description == "Brute force detected"
 
+    def test_correlate_alerts_skips_unparseable_timestamp(self):
+        """Alerts with corrupt or empty timestamps are skipped without raising ValueError."""
+        alerts = [
+            _alert(1, "2026-10-05T10:00:00.000Z", "5710", 5, "Valid alert", "web01",
+                   src_ip="1.2.3.4", mitre_tactics=["T1110.001"]),
+            _alert(2, "not-a-date", "5710", 5, "Corrupt timestamp", "web01",
+                   src_ip="1.2.3.4", mitre_tactics=["T1110.001"]),
+            _alert(3, "", "5712", 10, "Empty timestamp", "web01",
+                   src_ip="1.2.3.4", mitre_tactics=["T1110.001"]),
+        ]
+        result = correlate_alerts(alerts)
+        assert len(result) == 1
+        assert result[0].alert_count == 1
+        assert result[0].alert_ids == [1]
+
 
 class TestFullSampleData:
     """Test against the actual 8-alert sample dataset structure."""

@@ -4,8 +4,10 @@ Tests schema integrity, edge-case normalization, deduplication, and SQLite persi
 """
 
 import json
+import sqlite3
 import pytest
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 from src.ingestion.database import AlertDatabase, NormalizedAlert
 from src.ingestion.wazuh_client import normalize_wazuh_alert, WazuhClient
@@ -343,4 +345,242 @@ def test_dead_letter_on_non_numeric_rule_level(tmp_path):
         rows = conn.cursor().execute("SELECT * FROM dead_letter").fetchall()
         assert len(rows) == 1
         assert "NormalizationError" in rows[0]["error_reason"]
+
+
+def test_normalize_wazuh_alert_unparseable_timestamp(tmp_path):
+    """Alerts with invalid/unparseable timestamps are rejected and dead-lettered."""
+    raw = {
+        "timestamp": "not-a-date",
+        "rule": {"id": "5712", "level": 10, "description": "SSH brute force"},
+        "agent": {"name": "web01"}
+    }
+    assert normalize_wazuh_alert(raw) is None
+
+    db_file = tmp_path / "test_unparseable_ts.db"
+    sample_file = tmp_path / "alerts_bad_ts.json"
+    sample_file.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+
+    client = WazuhClient(str(db_file))
+    count = client.ingest_from_file(str(sample_file))
+    assert count == 0
+    with client.db._get_connection() as conn:
+        rows = conn.cursor().execute("SELECT * FROM dead_letter").fetchall()
+        assert len(rows) == 1
+        assert "NormalizationError" in rows[0]["error_reason"]
+
+
+def test_dedup_canonical_payload_sort_keys():
+    """Identical alerts with scrambled JSON key order produce the exact same content hash."""
+    payload_a = {"timestamp": "2026-10-05T10:00:00Z", "rule": {"id": "5712", "level": 10}, "z": 99, "a": 1}
+    payload_b = {"a": 1, "z": 99, "rule": {"level": 10, "id": "5712"}, "timestamp": "2026-10-05T10:00:00Z"}
+
+    alert_a = normalize_wazuh_alert(payload_a)
+    alert_b = normalize_wazuh_alert(payload_b)
+    assert alert_a is not None and alert_b is not None
+    assert alert_a.content_hash() == alert_b.content_hash()
+
+
+def test_database_v1_to_v2_migration(tmp_path):
+    """A legacy v1 database (without schema_version table) is migrated to v2 and rehashed."""
+    db_file = tmp_path / "legacy_v1.db"
+
+    with sqlite3.connect(db_file) as conn:
+        conn.execute("""
+            CREATE TABLE alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_hash TEXT NOT NULL UNIQUE,
+                timestamp TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                rule_level INTEGER NOT NULL,
+                rule_description TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                src_ip TEXT,
+                dst_ip TEXT,
+                user TEXT,
+                process TEXT,
+                mitre_tactics TEXT,
+                raw_payload TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        legacy_payload = json.dumps({
+            "timestamp": "2026-10-05T10:00:00.000Z",
+            "rule": {"id": "5712", "level": 10, "description": "SSH brute force"},
+            "agent": {"name": "web01"},
+            "full_log": "sshd: brute force attack"
+        })
+        conn.execute(
+            "INSERT INTO alerts (content_hash, timestamp, rule_id, rule_level, rule_description, agent_name, raw_payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("legacy_old_hash_12345", "2026-10-05T10:00:00.000Z", "5712", 10, "SSH brute force", "web01", legacy_payload)
+        )
+        conn.commit()
+
+    # Open with AlertDatabase -> must trigger migration to schema version 2
+    client = WazuhClient(str(db_file))
+    assert client.db.get_schema_version() == 2
+
+    # The row in DB should now have the canonical v2 hash
+    with client.db._get_connection() as conn:
+        row = conn.cursor().execute("SELECT content_hash FROM alerts WHERE id = 1").fetchone()
+        assert row[0] != "legacy_old_hash_12345"
+
+    # Re-ingesting the exact same alert from a file should now be detected as duplicate (0 inserted)
+    sample_file = tmp_path / "reingest.json"
+    sample_file.write_text(legacy_payload + "\n", encoding="utf-8")
+    inserted = client.ingest_from_file(str(sample_file))
+    assert inserted == 0
+    assert client.db.count() == 1
+
+
+def test_ingest_from_indexer_ascending_and_checkpoint(tmp_path):
+    """Indexer queries must sort ascending, paginate, and advance checkpoint keyed per URL/index."""
+    db_file = tmp_path / "indexer_test.db"
+    client = WazuhClient(str(db_file))
+
+    hits_data = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "hit1",
+                    "_source": {
+                        "timestamp": "2026-10-05T10:00:00.000Z",
+                        "rule": {"id": "5710", "level": 5, "description": "Login attempt"},
+                        "agent": {"name": "web01"}
+                    },
+                    "sort": ["2026-10-05T10:00:00.000Z", "hit1"]
+                },
+                {
+                    "_id": "hit2",
+                    "_source": {
+                        "timestamp": "2026-10-05T10:00:05.000Z",
+                        "rule": {"id": "5712", "level": 10, "description": "Brute force"},
+                        "agent": {"name": "web01"}
+                    },
+                    "sort": ["2026-10-05T10:00:05.000Z", "hit2"]
+                }
+            ]
+        }
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(hits_data).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        count = client.ingest_from_indexer(
+            indexer_url="https://mock-indexer:9200",
+            index_pattern="wazuh-alerts-*",
+            user="admin",
+            password="secret_password",
+            verify_ssl=False,
+            limit=10
+        )
+        assert count == 2
+        assert client.db.count() == 2
+
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data.decode("utf-8"))
+        assert body["sort"][0]["timestamp"]["order"] == "asc"
+
+        chk = client.db.get_checkpoint("https://mock-indexer:9200/wazuh-alerts-*")
+        assert chk == "2026-10-05T10:00:05.000Z"
+
+
+def test_ingest_from_indexer_pagination_search_after(tmp_path):
+    """When hits exceed page_size, search_after cursor is passed in consecutive page queries."""
+    db_file = tmp_path / "pagination_test.db"
+    client = WazuhClient(str(db_file))
+
+    page1_data = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "hit1",
+                    "_source": {
+                        "timestamp": "2026-10-05T10:00:01.000Z",
+                        "rule": {"id": "5710", "level": 5, "description": "Alert 1"},
+                        "agent": {"name": "web01"}
+                    },
+                    "sort": ["2026-10-05T10:00:01.000Z", "hit1"]
+                }
+            ]
+        }
+    }
+    page2_data = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "hit2",
+                    "_source": {
+                        "timestamp": "2026-10-05T10:00:02.000Z",
+                        "rule": {"id": "5710", "level": 5, "description": "Alert 2"},
+                        "agent": {"name": "web01"}
+                    },
+                    "sort": ["2026-10-05T10:00:02.000Z", "hit2"]
+                }
+            ]
+        }
+    }
+
+    resp1 = MagicMock()
+    resp1.read.return_value = json.dumps(page1_data).encode("utf-8")
+    resp1.__enter__.return_value = resp1
+
+    resp2 = MagicMock()
+    resp2.read.return_value = json.dumps(page2_data).encode("utf-8")
+    resp2.__enter__.return_value = resp2
+
+    with patch("urllib.request.urlopen", side_effect=[resp1, resp2]) as mock_urlopen:
+        count = client.ingest_from_indexer(
+            indexer_url="https://mock-indexer:9200",
+            index_pattern="wazuh-alerts-*",
+            user="admin",
+            password="secret_password",
+            verify_ssl=False,
+            limit=2,
+            page_size=1
+        )
+        assert count == 2
+        assert client.db.count() == 2
+        assert mock_urlopen.call_count == 2
+
+        # Verify page 2 payload included search_after from page 1
+        req2 = mock_urlopen.call_args_list[1][0][0]
+        body2 = json.loads(req2.data.decode("utf-8"))
+        assert body2.get("search_after") == ["2026-10-05T10:00:01.000Z", "hit1"]
+
+
+def test_fetch_agent_inventory_success_and_auth_error(tmp_path):
+    """fetch_agent_inventory retrieves agents list via JWT auth or fails cleanly."""
+    client = WazuhClient(str(tmp_path / "client.db"))
+
+    with pytest.raises(ValueError, match="WAZUH_API_PASSWORD required"):
+        client.fetch_agent_inventory(user="admin", password="")
+
+    token_resp = MagicMock()
+    token_resp.read.return_value = json.dumps({"data": {"token": "mock-token-xyz"}}).encode("utf-8")
+    token_resp.__enter__.return_value = token_resp
+
+    agents_resp = MagicMock()
+    agents_resp.read.return_value = json.dumps({
+        "data": {
+            "affected_items": [
+                {"id": "001", "name": "web01", "ip": "192.168.1.10", "group": ["web-servers"]},
+                {"id": "002", "name": "db01", "ip": "192.168.1.20", "group": ["databases"]}
+            ]
+        }
+    }).encode("utf-8")
+    agents_resp.__enter__.return_value = agents_resp
+
+    with patch("urllib.request.urlopen", side_effect=[token_resp, agents_resp]):
+        agents = client.fetch_agent_inventory(
+            api_url="https://localhost:55000",
+            user="wazuh-wui",
+            password="test_password",
+            verify_ssl=False
+        )
+        assert len(agents) == 2
+        assert agents[0]["name"] == "web01"
+        assert agents[1]["name"] == "db01"
 

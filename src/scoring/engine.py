@@ -90,21 +90,37 @@ class RiskScoringEngine:
     def __init__(self, config_path: Optional[str] = "config/weights.yaml"):
         self.config = self._load_config(config_path)
 
-        # Extract normalized weights (ensure they sum to 1.0)
+        # Extract normalized weights (ensure they are non-negative and sum to > 0)
         raw_w = self.config.get("weights", {})
         w_sev = float(raw_w.get("severity", 0.35))
         w_cti = float(raw_w.get("threat_intel", 0.40))
         w_kc = float(raw_w.get("kill_chain", 0.25))
+
+        if w_sev < 0 or w_cti < 0 or w_kc < 0:
+            raise ValueError(f"Weights must be non-negative: severity={w_sev}, threat_intel={w_cti}, kill_chain={w_kc}")
+
         total_w = w_sev + w_cti + w_kc
+        if total_w <= 0:
+            raise ValueError(f"Sum of weights must be positive, got {total_w}")
 
         self.w_sev = w_sev / total_w
         self.w_cti = w_cti / total_w
         self.w_kc = w_kc / total_w
 
-        # Asset mappings: ensure host keys and values are strictly lowercased
+        # Asset mappings: validate tiers and ensure hosts reference valid tiers
         asset_cfg = self.config.get("assets", {})
         self.asset_tiers = asset_cfg.get("tiers", {"critical": 3.0, "high": 2.0, "medium": 1.5, "low": 1.0})
-        self.asset_hosts = {str(k).lower(): str(v).lower() for k, v in asset_cfg.get("hosts", {}).items()}
+        for tier_name, mult in self.asset_tiers.items():
+            if float(mult) <= 0:
+                raise ValueError(f"Asset tier multiplier for {tier_name!r} must be positive: {mult}")
+
+        self.asset_hosts = {}
+        for k, v in asset_cfg.get("hosts", {}).items():
+            tier_val = str(v).lower()
+            if tier_val not in self.asset_tiers:
+                raise ValueError(f"Host {k!r} assigned unknown asset tier {v!r}. Must be one of {list(self.asset_tiers.keys())}")
+            self.asset_hosts[str(k).lower()] = tier_val
+
         self.default_criticality = float(asset_cfg.get("default_criticality", 1.0))
 
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
@@ -140,25 +156,50 @@ class RiskScoringEngine:
         endpoint_tokens = {"laptop", "workstation", "pc", "kiosk", "desktop", "client", "endpoint"}
         is_endpoint = bool(tokens & endpoint_tokens)
 
-        # Critical infrastructure tokens (only if not an end-user device)
+        # Low value / ephemeral / test assets (strictly take precedence over server role tokens like db, web)
+        low_tokens = {"stage", "staging", "test", "dev", "ephemeral", "sandbox", "lab", "kiosk"}
+        if (tokens & low_tokens) or is_endpoint:
+            return "low", float(self.asset_tiers.get("low", 1.0))
+
+        # Critical infrastructure tokens (only if not test/endpoint)
         critical_tokens = {"dc", "domain", "db", "database", "ldap", "pki", "vault", "auth", "ad"}
-        if not is_endpoint and (tokens & critical_tokens):
+        if tokens & critical_tokens:
             return "critical", float(self.asset_tiers.get("critical", 3.0))
 
         # High value server roles
         high_tokens = {"web", "api", "gateway", "proxy", "nginx", "apache", "prod", "production"}
-        if not is_endpoint and (tokens & high_tokens):
+        if tokens & high_tokens:
             return "high", float(self.asset_tiers.get("high", 2.0))
 
-        # Low value / ephemeral / test assets
-        low_tokens = {"stage", "staging", "test", "dev", "ephemeral", "sandbox", "lab", "kiosk"}
-        if tokens & low_tokens:
-            return "low", float(self.asset_tiers.get("low", 1.0))
-
-        if is_endpoint:
-            return "low", float(self.asset_tiers.get("low", 1.0))
-
         return "medium", self.default_criticality
+
+    def register_agent_inventory(self, agents: List[Dict[str, Any]]) -> int:
+        """Dynamically registers hosts discovered from Wazuh agent inventory into asset classification.
+        Inspects agent name and group tags to populate asset tiers for unconfigured hosts.
+        Returns count of newly registered hosts.
+        """
+        registered = 0
+        for agent in agents:
+            name = agent.get("name")
+            if not name:
+                continue
+            name_lower = str(name).lower()
+            if name_lower not in self.asset_hosts:
+                tier, _ = self.get_asset_context(name_lower)
+                # Check agent groups for hints if name was default medium
+                groups = agent.get("group", [])
+                if isinstance(groups, str):
+                    groups = [groups]
+                for g in groups:
+                    g_lower = str(g).lower()
+                    if any(t in g_lower for t in ("db", "database", "dc", "domain")):
+                        tier = "critical"
+                        break
+                    elif any(t in g_lower for t in ("web", "api", "prod")):
+                        tier = "high"
+                self.asset_hosts[name_lower] = tier
+                registered += 1
+        return registered
 
     def score_incident(
         self,
