@@ -270,6 +270,19 @@ class TestCorrelateAlerts:
         assert result[0].representative_rule_id == "5712"
         assert result[0].max_severity == 12
 
+    def test_target_aware_mode_collapses_ip_rotating_spray(self):
+        """Target-aware mode merges rotating-IP bursts hitting the same host and technique."""
+        alerts = [
+            _alert(i + 1, f"2026-10-05T10:00:{i:02d}.000Z", "5710", 5,
+                   "Failed login", "db01", src_ip=f"203.0.113.{i + 1}", mitre_tactics=["T1110.001"])
+            for i in range(25)
+        ]
+        assert len(correlate_alerts(alerts, window_seconds=120, mode="source_ip")) == 25
+        merged = correlate_alerts(alerts, window_seconds=120, mode="target_aware")
+        assert len(merged) == 1
+        assert merged[0].alert_count == 25
+        assert len(merged[0].src_ips) == 25
+
 
 class TestFullSampleData:
     """Test against the actual 8-alert sample dataset structure."""

@@ -36,7 +36,7 @@ def _make_sample_incident(
 class TestRiskScoringEngine:
     @pytest.fixture
     def engine(self):
-        return RiskScoringEngine(config_path="config/weights.yaml")
+        return RiskScoringEngine(config_path="config/weights.yaml", scoring_version="v1")
 
     def test_weights_sum_to_one(self, engine):
         total = engine.w_sev + engine.w_cti + engine.w_kc
@@ -253,3 +253,91 @@ class TestRiskScoringEngine:
         engine.register_agent_inventory(agents)
         assert engine.get_asset_context("test-db01") == ("low", 1.0)
         assert engine.get_asset_context("worker-02") == ("low", 1.0)
+
+
+class TestRiskScoringEngineV2:
+    @pytest.fixture
+    def engine_v2(self):
+        return RiskScoringEngine(config_path="config/weights.yaml", scoring_version="v2")
+
+    def test_v2_no_clean_ip_penalty(self, engine_v2):
+        """A fresh unreported external IP (score=0) must not score lower than offline/unknown CTI."""
+        inc = _make_sample_incident(agent_name="web01", src_ip="203.0.113.55", rule_level=10, technique_family="T1190")
+        attack = ATTACKProfile("T1190", "Initial Access", "TA0001", 4, 0.4, False)
+
+        clean_cti = CTIReport("203.0.113.55", 0.0, 0.0, 0.0, 0.0, False, "abuseipdb")
+        unknown_cti = CTIReport("203.0.113.55", 0.0, 0.0, 0.0, 0.0, False, "unknown")
+
+        s_clean = engine_v2.score_incident(inc, clean_cti, attack)
+        s_unknown = engine_v2.score_incident(inc, unknown_cti, attack)
+        assert s_clean.incident_risk == s_unknown.incident_risk
+        assert s_clean.score_breakdown["version"] == "v2"
+
+    def test_v2_outcome_differentiates_failed_vs_compromise(self, engine_v2):
+        """Active exploitation outranks failed brute-force even at equal Wazuh rule level."""
+        cti = CTIReport("LOCAL", 0.0, 0.0, 0.0, 0.0, True, "local")
+        failed_inc = CorrelatedIncident(
+            src_ip="203.0.113.1", agent_name="web01", technique_family="T1110",
+            alert_count=5, max_severity=10, first_seen="2026-10-05T10:00:00Z",
+            last_seen="2026-10-05T10:00:10Z", alert_ids=[1], mitre_techniques=["T1110"],
+            rule_ids=["5712"], representative_description="sshd: brute force attempt",
+            representative_rule_id="5712"
+        )
+        exploit_inc = CorrelatedIncident(
+            src_ip="203.0.113.2", agent_name="web01", technique_family="T1190",
+            alert_count=1, max_severity=10, first_seen="2026-10-05T10:00:00Z",
+            last_seen="2026-10-05T10:00:00Z", alert_ids=[2], mitre_techniques=["T1190"],
+            rule_ids=["100130"], representative_description="Web Application Attack (SQL Injection)",
+            representative_rule_id="100130"
+        )
+        mapper = ATTACKMapper()
+        scored = engine_v2.score_all([failed_inc, exploit_inc], type("C", (), {"lookup_ip": lambda *a, **k: cti})(), mapper)
+        assert scored[0].incident.technique_family == "T1190"
+        assert scored[0].incident_risk > scored[1].incident_risk
+
+    def test_v2_entity_risk_strictly_bounded_and_timed_sequences(self, engine_v2):
+        """Entity risk stays in [0, 100) even under flood, and 9-month gaps receive 1.0x bonus."""
+        cti = CTIReport("LOCAL", 0.0, 0.0, 0.0, 0.0, True, "local")
+        attack = ATTACKProfile("T1110", "Credential Access", "TA0006", 8, 0.8, False)
+
+        flood = [
+            engine_v2.score_incident(
+                _make_sample_incident(agent_name="web01", rule_level=5, technique_family="T1110"),
+                cti, attack
+            )
+            for _ in range(500)
+        ]
+        ent_flood = engine_v2.aggregate_by_entity(flood)[0]
+        assert 0.0 <= ent_flood.total_entity_risk <= 100.0
+
+        # Two events 9 months apart -> no sequence bonus (1.0x)
+        far_a = CorrelatedIncident(
+            src_ip=None, agent_name="web01", technique_family="T1595",
+            alert_count=1, max_severity=3, first_seen="2026-01-05T10:00:00Z",
+            last_seen="2026-01-05T10:00:00Z", alert_ids=[1], mitre_techniques=["T1595"],
+            rule_ids=["1"], representative_description="scan", representative_rule_id="1"
+        )
+        far_b = CorrelatedIncident(
+            src_ip=None, agent_name="web01", technique_family="T1486",
+            alert_count=1, max_severity=3, first_seen="2026-10-05T10:00:00Z",
+            last_seen="2026-10-05T10:00:00Z", alert_ids=[2], mitre_techniques=["T1486"],
+            rule_ids=["2"], representative_description="impact", representative_rule_id="2"
+        )
+        ent_far = engine_v2.aggregate_by_entity([
+            engine_v2.score_incident(far_a, cti, ATTACKProfile("T1595", "Reconnaissance", "TA0043", 1, 0.1, False)),
+            engine_v2.score_incident(far_b, cti, ATTACKProfile("T1486", "Impact", "TA0040", 10, 1.0, False)),
+        ])[0]
+        assert ent_far.tactics_depth_bonus == 1.0
+
+        # Ordered chain within 15 min -> sequence bonus > 1.0x
+        close_b = CorrelatedIncident(
+            src_ip=None, agent_name="web01", technique_family="T1548",
+            alert_count=1, max_severity=12, first_seen="2026-01-05T10:05:00Z",
+            last_seen="2026-01-05T10:05:00Z", alert_ids=[3], mitre_techniques=["T1548"],
+            rule_ids=["100100"], representative_description="sudoers", representative_rule_id="100100"
+        )
+        ent_close = engine_v2.aggregate_by_entity([
+            engine_v2.score_incident(far_a, cti, ATTACKProfile("T1110", "Credential Access", "TA0006", 8, 0.8, False)),
+            engine_v2.score_incident(close_b, cti, ATTACKProfile("T1548", "Privilege Escalation", "TA0004", 9, 0.9, False)),
+        ])[0]
+        assert ent_close.tactics_depth_bonus > 1.0

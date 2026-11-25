@@ -50,7 +50,9 @@ class OpenRBAPipeline:
         weights_config: str = "config/weights.yaml",
         api_key: Optional[str] = None,
         mock_intel: Optional[Dict[str, Any]] = None,
-        use_mock_cti: bool = False
+        use_mock_cti: bool = False,
+        scoring_version: Optional[str] = None,
+        correlation_mode: Optional[str] = None,
     ):
         base_dir = Path(__file__).parent.parent
         resolved_db = db_path if Path(db_path).is_absolute() else str(base_dir / db_path)
@@ -58,9 +60,11 @@ class OpenRBAPipeline:
 
         self.db_path = resolved_db
         self.wazuh_client = WazuhClient(db_path=resolved_db)
-        self.db = AlertDatabase(db_path=resolved_db)
-        self.scoring_engine = RiskScoringEngine(config_path=resolved_weights)
+        self.db = self.wazuh_client.db
+        self.scoring_engine = RiskScoringEngine(config_path=resolved_weights, scoring_version=scoring_version)
         self.attack_mapper = ATTACKMapper()
+        cfg_corr_mode = self.scoring_engine.config.get("correlation", {}).get("mode", "source_ip")
+        self.correlation_mode = correlation_mode or cfg_corr_mode
 
         # Load lambda decay factor from config
         decay_cfg = self.scoring_engine.config.get("temporal_decay", {})
@@ -118,7 +122,7 @@ class OpenRBAPipeline:
         window_seconds = int(
             self.scoring_engine.config.get("correlation", {}).get("time_window_seconds", 120)
         )
-        correlated = correlate_alerts(raw_alerts, window_seconds=window_seconds)
+        correlated = correlate_alerts(raw_alerts, window_seconds=window_seconds, mode=self.correlation_mode)
         reduction = alert_reduction_ratio(len(raw_alerts), len(correlated))
 
         # --- Stage 3, 4, 5: Enrichment, ATT&CK, Risk Scoring ---
@@ -160,7 +164,8 @@ def format_table(results: Dict[str, Any]) -> str:
 
     for rank, s in enumerate(results["scored_incidents"], 1):
         inc = s.incident
-        src = inc.src_ip or "LOCAL"
+        extra_ips = len(getattr(inc, "src_ips", []) or [])
+        src = f"{inc.src_ip} (+{extra_ips - 1})" if (inc.src_ip and extra_ips > 1) else (inc.src_ip or "LOCAL")
         tactic = s.attack.primary_tactic
         tech = s.attack.primary_technique
         lines.append(
@@ -205,10 +210,17 @@ def main():
                         help="Maximum recent alerts to pull from the database for scoring")
     parser.add_argument("--no-ingest", action="store_true",
                         help="Skip file ingestion and score existing alerts in the database")
+    parser.add_argument("--scoring-version", type=str, choices=["v1", "v2"], default=None,
+                        help="Override scoring engine version (v1 or v2)")
 
     args = parser.parse_args()
     use_mock = args.mock_cti or args.demo
-    pipeline = OpenRBAPipeline(db_path=args.db, weights_config=args.weights, use_mock_cti=use_mock)
+    pipeline = OpenRBAPipeline(
+        db_path=args.db,
+        weights_config=args.weights,
+        use_mock_cti=use_mock,
+        scoring_version=args.scoring_version,
+    )
 
     target_file = None
     if not args.no_ingest:

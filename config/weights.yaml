@@ -1,4 +1,4 @@
-# Multi-Factor Risk Scoring Weights (Normalized base weights sum to 1.0)
+# Multi-Factor Risk Scoring Weights (Normalized base weights sum to 1.0 for v1)
 weights:
   severity: 0.35         # w1: Baseline rule severity (1-15 normalized to [0,1])
   threat_intel: 0.40     # w2: CTI confidence subjected to temporal decay [0,1]
@@ -10,6 +10,7 @@ temporal_decay:
 
 correlation:
   time_window_seconds: 120   # Window for grouping related alert bursts
+  mode: target_aware         # source_ip (v1) | target_aware (collapses rotating-IP sprays by target)
 
 assets:
   default_criticality: 1.0
@@ -22,3 +23,32 @@ assets:
     db01: critical
     web01: high
     fedora01: medium
+
+scoring:
+  version: v2       # v1 (baseline) | v2 (confidence x impact, rarity, outcome, bounded entity timeline)
+  v2:
+    cti_boost_weight: 0.15       # Capped upward confidence boost from decayed CTI (no clean-IP penalty)
+    rarity_weight: 0.20          # Weight for (rule_id, host) IDF rarity signal
+    outcome_fail_penalty: 0.65   # Confidence multiplier for failed-only / blocked attempts
+    outcome_success_boost: 1.25  # Confidence multiplier for confirmed success or post-exploitation
+    privileged_user_boost: 0.15  # Impact boost when privileged accounts are targeted/involved
+    entity_scale_k: 2.5          # Saturation scale for bounded [0, 100] entity risk: 100*(1 - exp(-R/k))
+    entity_lambda_days: 0.10     # Daily exponential decay across entity timeline
+    entity_window_days: 30       # Rolling window W in days for entity risk aggregation
+
+sequences:
+  - name: brute_force_to_compromise
+    from_tactics: ["Credential Access"]
+    to_tactics: ["Initial Access", "Execution", "Privilege Escalation"]
+    max_gap_seconds: 900
+    bonus: 0.50
+  - name: access_to_privilege_escalation
+    from_tactics: ["Initial Access", "Credential Access", "Execution"]
+    to_tactics: ["Privilege Escalation", "Defense Evasion", "Impact", "Exfiltration"]
+    max_gap_seconds: 3600
+    bonus: 0.75
+  - name: recon_to_exploit
+    from_tactics: ["Reconnaissance", "Discovery"]
+    to_tactics: ["Initial Access", "Execution", "Privilege Escalation"]
+    max_gap_seconds: 3600
+    bonus: 0.40

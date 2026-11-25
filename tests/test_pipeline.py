@@ -15,7 +15,8 @@ def test_full_pipeline_sample_alerts(tmp_path):
 
     pipeline = OpenRBAPipeline(
         db_path=str(db_file),
-        weights_config=str(weights_file)
+        weights_config=str(weights_file),
+        scoring_version="v1",
     )
 
     results = pipeline.run(file_path=str(sample_file))
@@ -72,3 +73,21 @@ def test_pipeline_since_window(tmp_path):
     windowed = pipeline.run(since="2026-10-05T10:15:00Z")
     assert windowed["raw_alerts_count"] == 2
     assert windowed["incidents_count"] == 2
+
+
+def test_full_pipeline_v2_default(tmp_path):
+    db_file = tmp_path / "pipeline_v2.db"
+    sample_file = Path(__file__).parent.parent / "data" / "sample_alerts.json"
+    weights_file = Path(__file__).parent.parent / "config" / "weights.yaml"
+
+    pipeline = OpenRBAPipeline(db_path=str(db_file), weights_config=str(weights_file), use_mock_cti=True)
+    results = pipeline.run(file_path=str(sample_file))
+
+    assert results["status"] == "success"
+    scored = results["scored_incidents"]
+    assert scored[0].score_breakdown["version"] == "v2"
+    assert scored[0].attack.primary_tactic == "Privilege Escalation"
+    assert "top_signals" in scored[0].score_breakdown
+    entities = results["entities"]
+    assert 0.0 <= entities[0].total_entity_risk <= 100.0
+    assert entities[0].agent_name == "web01"

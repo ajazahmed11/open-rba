@@ -93,6 +93,8 @@ class CorrelatedIncident:
     representative_description: str # Description from the highest-severity alert
     representative_rule_id: str = "" # Rule ID from the highest-severity alert
     mitre_tactic_names: List[str] = field(default_factory=list) # All observed tactic names
+    src_ips: List[str] = field(default_factory=list) # All distinct source IPs in the cluster
+    users: List[str] = field(default_factory=list)   # All distinct target usernames in the cluster
 
     @property
     def group_key(self) -> str:
@@ -105,15 +107,21 @@ class CorrelatedIncident:
 # Correlation engine
 # ---------------------------------------------------------------------------
 
-def _make_group_key(alert: Dict[str, Any]) -> tuple:
+def _make_group_key(alert: Dict[str, Any], mode: str = "source_ip") -> tuple:
     """Compute the correlation grouping key for an alert.
 
-    Returns (src_ip_or_LOCAL, agent_name, technique_family).
+    Modes:
+      - source_ip (v1): (src_ip_or_LOCAL, agent_name, technique_family)
+      - target_aware (v2): collapses external multi-IP sprays/scans targeting the same
+        (agent_name, technique_family), while keeping LOCAL host events separate.
     """
     src = alert.get("src_ip") or "LOCAL"
     agent = alert.get("agent_name", "unknown")
     techniques = alert.get("mitre_tactics") or []
     family = extract_technique_family(techniques, str(alert.get("rule_id", "0")))
+    if mode == "target_aware":
+        src_scope = "LOCAL" if src == "LOCAL" else "EXTERNAL"
+        return (src_scope, agent, family)
     return (src, agent, family)
 
 
@@ -124,8 +132,12 @@ def _new_cluster(alert: Dict[str, Any], ts: datetime, family: str) -> dict:
     rule_id = str(alert.get("rule_id", "0"))
     rule_level = int(alert.get("rule_level", 0))
     desc = alert.get("rule_description", "")
+    src_ip = alert.get("src_ip")
+    user = alert.get("user")
     return {
-        "src_ip": alert.get("src_ip"),
+        "src_ip": src_ip,
+        "src_ips": [src_ip] if src_ip else [],
+        "users": [user] if user else [],
         "agent_name": alert.get("agent_name", "unknown"),
         "technique_family": family,
         "first_seen": alert.get("timestamp", ""),
@@ -150,6 +162,13 @@ def _extend_cluster(cluster: dict, alert: Dict[str, Any], ts: datetime) -> None:
     cluster["alert_ids"].append(alert.get("id", 0))
     cluster["alert_count"] += 1
 
+    src_ip = alert.get("src_ip")
+    if src_ip and src_ip not in cluster["src_ips"]:
+        cluster["src_ips"].append(src_ip)
+    user = alert.get("user")
+    if user and user not in cluster["users"]:
+        cluster["users"].append(user)
+
     rule_level = int(alert.get("rule_level", 0))
     if rule_level > cluster["max_severity"]:
         cluster["max_severity"] = rule_level
@@ -172,8 +191,10 @@ def _extend_cluster(cluster: dict, alert: Dict[str, Any], ts: datetime) -> None:
 def _finalize_cluster(cluster: dict) -> CorrelatedIncident:
     """Convert internal cluster state dict into a CorrelatedIncident."""
     rep_rule = cluster.get("representative_rule_id") or (cluster["rule_ids"][0] if cluster["rule_ids"] else "")
+    src_ips = cluster.get("src_ips", [])
+    primary_src = src_ips[0] if src_ips else cluster["src_ip"]
     return CorrelatedIncident(
-        src_ip=cluster["src_ip"],
+        src_ip=primary_src,
         agent_name=cluster["agent_name"],
         technique_family=cluster["technique_family"],
         alert_count=cluster["alert_count"],
@@ -186,12 +207,15 @@ def _finalize_cluster(cluster: dict) -> CorrelatedIncident:
         representative_description=cluster["representative_description"],
         representative_rule_id=rep_rule,
         mitre_tactic_names=cluster.get("mitre_tactic_names", []),
+        src_ips=src_ips,
+        users=cluster.get("users", []),
     )
 
 
 def correlate_alerts(
     alerts: List[Dict[str, Any]],
     window_seconds: int = 120,
+    mode: str = "source_ip",
 ) -> List[CorrelatedIncident]:
     """
     Temporal correlation engine.
@@ -252,7 +276,7 @@ def correlate_alerts(
     completed: List[CorrelatedIncident] = []
 
     for ts, alert in valid_alerts:
-        key = _make_group_key(alert)
+        key = _make_group_key(alert, mode=mode)
         family = key[2]  # technique_family from the tuple
 
         if key in active:
