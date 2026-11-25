@@ -121,3 +121,10 @@ class TestATTACKMapper:
         assert prof.primary_tactic == "Persistence"
         assert prof.stage_depth == 6
         assert prof.inferred is False
+
+    def test_fim_integrity_not_falsely_defense_evasion(self, mapper):
+        # Routine Wazuh FIM 'Integrity checksum changed.' without MITRE tags should not score Defense Evasion (0.70)
+        prof = mapper.evaluate_incident([], "Integrity checksum changed.", "550")
+        assert prof.primary_tactic == "Discovery"
+        assert prof.stage_depth == 2
+        assert prof.normalized_depth == 0.2

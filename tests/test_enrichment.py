@@ -123,3 +123,18 @@ class TestThreatIntelClient:
         report = client.lookup_ip("198.51.100.5")
         assert report.source == "cache-stale"
         assert report.raw_score == 90.0
+
+    def test_rate_limit_circuit_breaker(self, tmp_path):
+        import urllib.error
+        from unittest.mock import patch
+
+        client = ThreatIntelClient(api_key="test-key", db_path=str(tmp_path / "cti.db"))
+        err_429 = urllib.error.HTTPError("https://api.abuseipdb.com", 429, "Too Many Requests", {}, None)
+
+        with patch("urllib.request.urlopen", side_effect=err_429) as mock_open:
+            r1 = client.lookup_ip("203.0.113.10")
+            r2 = client.lookup_ip("203.0.113.11")
+            assert r1.source == "error"
+            assert r2.source == "error"
+            # Circuit breaker stops further HTTP calls after HTTP 429
+            assert mock_open.call_count == 1

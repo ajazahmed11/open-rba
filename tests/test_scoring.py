@@ -244,3 +244,12 @@ class TestRiskScoringEngine:
         tier, mult = engine.get_asset_context("generic-worker")
         assert tier == "low"
         assert mult == 1.0
+
+    def test_register_agent_inventory_ignores_debug_substring_and_keeps_test_low(self, engine):
+        agents = [
+            {"name": "test-db01", "group": ["databases"]},
+            {"name": "worker-02", "group": ["debug-group"]},
+        ]
+        engine.register_agent_inventory(agents)
+        assert engine.get_asset_context("test-db01") == ("low", 1.0)
+        assert engine.get_asset_context("worker-02") == ("low", 1.0)

@@ -31,7 +31,12 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
     Handles field variance across different rule decoders and event sources.
     """
     try:
-        rule_block = raw.get("rule", {})
+        if not isinstance(raw, dict):
+            return None
+        rule_block = raw.get("rule")
+        if not isinstance(rule_block, dict):
+            logger.warning("Alert missing valid rule object")
+            return None
         rule_id = str(rule_block.get("id", "0"))
         
         # Rule level must be a valid integer
@@ -44,10 +49,14 @@ def normalize_wazuh_alert(raw: Dict[str, Any]) -> Optional[NormalizedAlert]:
 
         rule_desc = rule_block.get("description", "Unknown rule")
 
-        agent_block = raw.get("agent", {})
-        agent_name = agent_block.get("name") or "manager"
+        agent_block = raw.get("agent")
+        if not isinstance(agent_block, dict):
+            agent_block = {}
+        agent_name = str(agent_block.get("name") or "manager")
 
-        data_block = raw.get("data", {})
+        data_block = raw.get("data")
+        if not isinstance(data_block, dict):
+            data_block = {}
         src_ip = data_block.get("srcip") or data_block.get("src_ip")
         dst_ip = data_block.get("dstip") or data_block.get("dst_ip")
         user = data_block.get("dstuser") or data_block.get("srcuser") or data_block.get("user")
@@ -120,19 +129,32 @@ class WazuhClient:
         if not path.exists():
             raise FileNotFoundError(f"Alerts file not found: {file_path}")
 
-        alerts: List[NormalizedAlert] = []
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
+        if limit is not None and limit <= 0:
+            return 0
 
-        if not content:
+        alerts: List[NormalizedAlert] = []
+        # Peek first non-whitespace char without buffering multi-GB JSONL files
+        first_char = ""
+        with open(path, "r", encoding="utf-8") as f:
+            while True:
+                ch = f.read(1)
+                if not ch:
+                    break
+                if not ch.isspace():
+                    first_char = ch
+                    break
+
+        if not first_char:
             return 0
 
         # Handle standard JSON array format: [ {...}, {...} ]
-        if content.startswith("[") and content.endswith("]"):
+        if first_char == "[":
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
             try:
                 data_list = json.loads(content)
                 if isinstance(data_list, list):
-                    if limit:
+                    if limit is not None:
                         data_list = data_list[-limit:]
                     for item in data_list:
                         if isinstance(item, dict):
@@ -150,15 +172,15 @@ class WazuhClient:
             except json.JSONDecodeError:
                 pass  # Fall through to line-by-line JSONL parser
 
-        # Handle standard line-by-line JSONL format
-        lines = content.splitlines()
-        if limit:
-            lines = lines[-limit:]
+        # Stream line-by-line JSONL format cleanly using bounded deque tail when limit is set
+        with open(path, "r", encoding="utf-8") as f:
+            non_empty_lines = (ln.strip() for ln in f if ln.strip())
+            if limit is not None:
+                selected_lines = list(deque(non_empty_lines, maxlen=limit))
+            else:
+                selected_lines = list(non_empty_lines)
 
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+        for line in selected_lines:
             try:
                 data = json.loads(line)
                 norm = normalize_wazuh_alert(data)
@@ -222,6 +244,9 @@ class WazuhClient:
         else:
             query_filter = {"match_all": {}}
 
+        if limit is not None and limit <= 0:
+            return 0
+
         alerts: List[NormalizedAlert] = []
         max_ts = checkpoint
         total_fetched = 0
@@ -263,6 +288,16 @@ class WazuhClient:
                     if not max_ts or norm.timestamp > max_ts:
                         max_ts = norm.timestamp
                 else:
+                    # Track valid timestamp even for dead-lettered docs to avoid infinite retry loops
+                    raw_hit_ts = source.get("timestamp") if isinstance(source, dict) else None
+                    if isinstance(raw_hit_ts, str) and raw_hit_ts.strip():
+                        try:
+                            from src.correlation.engine import parse_timestamp
+                            c_ts = parse_timestamp(raw_hit_ts).strftime("%Y-%m-%dT%H:%M:%S.%f")[:23] + "Z"
+                            if not max_ts or c_ts > max_ts:
+                                max_ts = c_ts
+                        except Exception:
+                            pass
                     self.db.record_dead_letter(
                         json.dumps(source, sort_keys=True),
                         "NormalizationError: Malformed indexer alert schema or timestamp"
@@ -275,7 +310,7 @@ class WazuhClient:
 
         # Advance checkpoint only after batch insert completes successfully
         inserted = self.db.insert_batch(alerts)
-        if max_ts and alerts:
+        if max_ts and (alerts or max_ts != checkpoint):
             self.db.set_checkpoint(checkpoint_key, max_ts)
 
         return inserted

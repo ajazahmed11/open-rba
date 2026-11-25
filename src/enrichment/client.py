@@ -113,8 +113,10 @@ class CTICache:
         self.init_schema()
 
     def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def init_schema(self) -> None:
@@ -169,6 +171,8 @@ class ThreatIntelClient:
         self.max_age_days = max_age_days
         self.cache_ttl_days = cache_ttl_days
         self.mock_data = mock_data or {}
+        self._session_cache: Dict[Tuple[str, Optional[str]], CTIReport] = {}
+        self._rate_limited: bool = False
 
     def lookup_ip(self, ip: Optional[str], alert_timestamp: Optional[str] = None) -> CTIReport:
         """
@@ -187,7 +191,15 @@ class ThreatIntelClient:
             )
 
         ip_clean = ip.strip()
+        session_key = (ip_clean, alert_timestamp)
+        if session_key in self._session_cache:
+            return self._session_cache[session_key]
 
+        report = self._lookup_ip_uncached(ip_clean, alert_timestamp)
+        self._session_cache[session_key] = report
+        return report
+
+    def _lookup_ip_uncached(self, ip_clean: str, alert_timestamp: Optional[str]) -> CTIReport:
         # Check mock database first (for reproducible testing / offline research)
         if ip_clean in self.mock_data:
             mock_entry = self.mock_data[ip_clean]
@@ -237,10 +249,12 @@ class ThreatIntelClient:
                     source="cache"
                 )
 
-        # Live API query if API key is present
-        if self.api_key and self.api_key != "your_abuseipdb_api_key_here":
+        # Live API query if API key is present and not circuit-broken by HTTP 429
+        if self.api_key and self.api_key != "your_abuseipdb_api_key_here" and not self._rate_limited:
             api_res, query_status = self._query_abuseipdb(ip_clean)
-            if api_res:
+            if query_status == "rate_limited":
+                self._rate_limited = True
+            if api_res is not None:
                 raw_score = float(api_res.get("abuseConfidenceScore", 0.0))
                 norm_score = max(0.0, min(1.0, raw_score / 100.0))
                 last_reported = api_res.get("lastReportedAt") or datetime.now(timezone.utc).isoformat()
@@ -283,7 +297,7 @@ class ThreatIntelClient:
                     source="error"
                 )
 
-        # If API is not configured or offline, but an expired cache record exists, serve it as stale
+        # If API is not configured or rate-limited, but an expired cache record exists, serve it as stale
         if cached:
             norm_score = cached["normalized_score"]
             raw_score = cached["raw_score"]
@@ -299,7 +313,7 @@ class ThreatIntelClient:
                 source="cache-stale"
             )
 
-        # Graceful fallback when offline / no key
+        # Graceful fallback when offline / no key / rate-limited
         return CTIReport(
             ip=ip_clean,
             raw_score=0.0,
@@ -307,7 +321,7 @@ class ThreatIntelClient:
             decayed_score=0.0,
             indicator_age_days=0.0,
             is_private=False,
-            source="unknown"
+            source="error" if self._rate_limited else "unknown"
         )
 
     def _query_abuseipdb(self, ip: str) -> Tuple[Optional[Dict[str, Any]], str]:

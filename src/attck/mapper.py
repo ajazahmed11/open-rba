@@ -182,11 +182,11 @@ class ATTACKMapper:
         if re.search(r'\b(nmap|port\s+scan|syn\s+scan|network\s+recon|service\s+scan)\b', desc):
             return "T1046", "Discovery"
 
-        if re.search(r'\b(tamper|integrity|log\s+cleared|audit\s+log|defense\s+evasion)\b', desc):
+        if re.search(r'\b(tamper(ing|ed)?|log\s+cleared|audit\s+log\s+(cleared|tamper|disabled|deleted)|defense\s+evasion)\b', desc):
             return "T1070", "Defense Evasion"
 
         if re.search(r'\b(powershell|bash|shell|exec(ute)?\s+command)\b', desc):
             return "T1059", "Execution"
 
-        # Default fallback
-        return f"rule:{rule_id}" if rule_id else "UNKNOWN", "Initial Access"
+        # Default fallback for unmapped rules -> low-depth Discovery rather than Initial Access
+        return f"rule:{rule_id}" if rule_id else "UNKNOWN", "Discovery"

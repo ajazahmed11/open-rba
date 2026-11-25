@@ -32,6 +32,16 @@ class NormalizedAlert:
     full_log: Optional[str] = None            # Full raw log message string
     mitre_tactic_names: Optional[List[str]] = None # MITRE tactic names (e.g., ["Credential Access"])
 
+    def __post_init__(self) -> None:
+        """Canonicalize valid ISO-8601 timestamps to UTC YYYY-MM-DDTHH:MM:SS.mmmZ."""
+        if isinstance(self.timestamp, str) and self.timestamp.strip():
+            try:
+                from src.correlation.engine import parse_timestamp
+                dt = parse_timestamp(self.timestamp)
+                self.timestamp = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:23] + "Z"
+            except Exception:
+                pass
+
     def content_hash(self) -> str:
         """Deterministic SHA-256 hash of identity fields for deduplication.
 
@@ -401,9 +411,20 @@ class AlertDatabase:
                 results.append(d)
             return results
 
+    def _canonicalize_bound(self, ts: str) -> str:
+        """Canonicalizes a query timestamp bound to UTC ISO-8601 (YYYY-MM-DDTHH:MM:SS.mmmZ)."""
+        try:
+            from src.correlation.engine import parse_timestamp
+            dt = parse_timestamp(ts)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:23] + "Z"
+        except Exception:
+            return ts
+
     def fetch_time_range(self, start: str, end: str) -> List[Dict[str, Any]]:
         """Retrieves alerts within a time range [start, end] inclusive.
-        Timestamps are compared lexicographically (ISO 8601 sorts correctly)."""
+        Bounds are canonicalized to UTC ISO-8601 before lexicographical SQL comparison."""
+        start_canon = self._canonicalize_bound(start)
+        end_canon = self._canonicalize_bound(end)
         sql = """
         SELECT * FROM alerts
         WHERE timestamp >= ? AND timestamp <= ?
@@ -411,7 +432,26 @@ class AlertDatabase:
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(sql, (start, end))
+            cursor.execute(sql, (start_canon, end_canon))
+            results = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                d["mitre_tactics"] = json.loads(d["mitre_tactics"]) if d.get("mitre_tactics") else []
+                d["mitre_tactic_names"] = json.loads(d["mitre_tactic_names"]) if d.get("mitre_tactic_names") else []
+                results.append(d)
+            return results
+
+    def fetch_since(self, start: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Retrieves alerts from [start, now] ordered chronologically ascending."""
+        start_canon = self._canonicalize_bound(start)
+        sql = "SELECT * FROM alerts WHERE timestamp >= ? ORDER BY timestamp ASC, id ASC"
+        params: List[Any] = [start_canon]
+        if limit is not None and limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
             results = []
             for row in cursor.fetchall():
                 d = dict(row)

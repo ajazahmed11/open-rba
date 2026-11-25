@@ -58,3 +58,17 @@ def test_full_pipeline_empty_db(tmp_path):
     assert results["status"] == "empty"
     assert results["raw_alerts_count"] == 0
     assert results["incidents_count"] == 0
+
+
+def test_pipeline_since_window(tmp_path):
+    db_file = tmp_path / "since_test.db"
+    sample_file = Path(__file__).parent.parent / "data" / "sample_alerts.json"
+    weights_file = Path(__file__).parent.parent / "config" / "weights.yaml"
+
+    pipeline = OpenRBAPipeline(db_path=str(db_file), weights_config=str(weights_file))
+    pipeline.run(file_path=str(sample_file))
+
+    # Only last 2 alerts occurred at >= 10:15:00Z
+    windowed = pipeline.run(since="2026-10-05T10:15:00Z")
+    assert windowed["raw_alerts_count"] == 2
+    assert windowed["incidents_count"] == 2

@@ -244,12 +244,14 @@ class TestCorrelateAlerts:
         assert result[0].alert_ids == [1]
 
     def test_correlate_alerts_guards_malformed_dicts(self):
-        """Non-dict items or dicts missing agent_name/rule_id/timestamp are safely ignored."""
+        """Non-dict items or dicts missing/null agent_name, rule_id, or bad rule_level are safely ignored."""
         alerts = [
             "not a dict",
             None,
             {"timestamp": "2026-10-05T10:00:00.000Z"},  # missing agent_name and rule_id
             {"timestamp": "2026-10-05T10:00:01.000Z", "agent_name": "web01"},  # missing rule_id
+            {"timestamp": "2026-10-05T10:00:01.500Z", "agent_name": None, "rule_id": "5710", "rule_level": 5},
+            {"timestamp": "2026-10-05T10:00:01.700Z", "agent_name": "web01", "rule_id": "5710", "rule_level": "bad"},
             _alert(1, "2026-10-05T10:00:02.000Z", "5710", 5, "Valid", "web01", src_ip="1.2.3.4")
         ]
         result = correlate_alerts(alerts)

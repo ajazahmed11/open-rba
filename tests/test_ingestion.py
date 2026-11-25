@@ -680,3 +680,37 @@ def test_fetch_agent_inventory_missing_token_raises(tmp_path):
                 verify_ssl=False
             )
 
+
+def test_fetch_time_range_canonical_z_boundaries(tmp_path):
+    """fetch_time_range handles Z vs .000Z boundary strings consistently."""
+    db = AlertDatabase(str(tmp_path / "bounds.db"))
+    norm = normalize_wazuh_alert({
+        "timestamp": "2026-10-05T10:00:00Z",
+        "rule": {"id": "5710", "level": 5, "description": "Boundary alert"},
+        "agent": {"name": "web01"}
+    })
+    assert norm is not None
+    db.insert_alert(norm)
+
+    res = db.fetch_time_range("2026-10-05T10:00:00Z", "2026-10-05T10:05:00Z")
+    assert len(res) == 1
+    assert res[0]["rule_id"] == "5710"
+
+    since_res = db.fetch_since("2026-10-05T10:00:00Z")
+    assert len(since_res) == 1
+
+
+def test_ingest_from_file_limit_zero(tmp_path):
+    """Passing limit=0 must ingest zero alerts instead of the entire file."""
+    sample_file = tmp_path / "alerts.jsonl"
+    sample_file.write_text(json.dumps({
+        "timestamp": "2026-10-05T10:00:00Z",
+        "rule": {"id": "5710", "level": 5},
+        "agent": {"name": "web01"}
+    }) + "\n", encoding="utf-8")
+
+    client = WazuhClient(str(tmp_path / "zero.db"))
+    assert client.ingest_from_file(str(sample_file), limit=0) == 0
+    assert client.db.count() == 0
+
+

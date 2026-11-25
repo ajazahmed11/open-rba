@@ -122,6 +122,8 @@ class RiskScoringEngine:
             self.asset_hosts[str(k).lower()] = tier_val
 
         self.default_criticality = float(asset_cfg.get("default_criticality", 1.0))
+        if self.default_criticality <= 0:
+            raise ValueError(f"default_criticality must be positive: {self.default_criticality}")
 
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
         if config_path:
@@ -186,17 +188,20 @@ class RiskScoringEngine:
             name_lower = str(name).lower()
             if name_lower not in self.asset_hosts:
                 tier, _ = self.get_asset_context(name_lower)
-                # Check agent groups for hints if name was default medium
-                groups = agent.get("group", [])
-                if isinstance(groups, str):
-                    groups = [groups]
-                for g in groups:
-                    g_lower = str(g).lower()
-                    if any(t in g_lower for t in ("db", "database", "dc", "domain")):
-                        tier = "critical"
-                        break
-                    elif any(t in g_lower for t in ("web", "api", "prod")):
-                        tier = "high"
+                # Preserve explicit low/ephemeral classification over group tags
+                tokens = set(re.split(r'[-_.\s0-9]+', name_lower))
+                is_explicit_low = bool(tokens & {"stage", "staging", "test", "dev", "ephemeral", "sandbox", "lab", "kiosk", "laptop", "workstation", "pc", "desktop", "client", "endpoint"})
+                if not is_explicit_low:
+                    groups = agent.get("group", [])
+                    if isinstance(groups, str):
+                        groups = [groups]
+                    for g in groups:
+                        g_tokens = set(re.split(r'[-_.\s0-9]+', str(g).lower()))
+                        if g_tokens & {"db", "database", "databases", "dc", "domain", "ldap", "pki", "vault"}:
+                            tier = "critical"
+                            break
+                        elif g_tokens & {"web", "api", "prod", "production", "gateway"}:
+                            tier = "high"
                 self.asset_hosts[name_lower] = tier
                 registered += 1
         return registered

@@ -86,8 +86,9 @@ class OpenRBAPipeline:
     def run(
         self,
         file_path: Optional[str] = None,
-        use_api: bool = False,
-        limit: int = 100
+        limit: int = 100,
+        since: Optional[str] = None,
+        db_limit: Optional[int] = None
     ) -> Dict[str, Any]:
         """Executes the complete pipeline and returns structured evaluation metrics."""
         # --- Stage 1: Ingestion ---
@@ -95,7 +96,14 @@ class OpenRBAPipeline:
         if file_path:
             ingested_count = self.wazuh_client.ingest_from_file(file_path, limit=limit)
 
-        raw_alerts = self.db.fetch_all()
+        if since:
+            raw_alerts = self.db.fetch_since(since, limit=db_limit)
+        elif db_limit is not None and db_limit > 0:
+            # fetch_recent returns descending; reverse to chronological for correlation
+            raw_alerts = list(reversed(self.db.fetch_recent(limit=db_limit)))
+        else:
+            raw_alerts = self.db.fetch_all()
+
         if not raw_alerts:
             return {
                 "status": "empty",
@@ -141,7 +149,7 @@ def format_table(results: Dict[str, Any]) -> str:
 
     lines.append(f"  • Total Raw Alerts Ingested : {raw_count}")
     lines.append(f"  • Correlated Incident Units : {inc_count}")
-    lines.append(f"  • Alert Noise Reduction     : {ratio:.1%} (Target: ≥70.0%)")
+    lines.append(f"  • Alert Noise Reduction     : {ratio:.1%}")
     lines.append("-" * 100)
 
     lines.append("\n🏆 PRIORITIZED INCIDENT QUEUE (Ranked by Dynamic Risk Score):")
@@ -190,7 +198,11 @@ def main():
     parser.add_argument("--weights", type=str, default="config/weights.yaml",
                         help="Path to multi-factor weights configuration")
     parser.add_argument("--limit", type=int, default=500,
-                        help="Maximum alerts to process")
+                        help="Maximum alerts to ingest from file")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Only correlate alerts at or after this ISO-8601 timestamp")
+    parser.add_argument("--db-limit", type=int, default=None,
+                        help="Maximum recent alerts to pull from the database for scoring")
     parser.add_argument("--no-ingest", action="store_true",
                         help="Skip file ingestion and score existing alerts in the database")
 
@@ -211,7 +223,12 @@ def main():
         elif pipeline.db.count() == 0:
             print("[Notice] Alerts database is empty. Use '--demo' or '--file <path>' to ingest alerts.")
 
-    results = pipeline.run(file_path=target_file, limit=args.limit)
+    results = pipeline.run(
+        file_path=target_file,
+        limit=args.limit,
+        since=args.since,
+        db_limit=args.db_limit
+    )
     print(format_table(results))
 
 

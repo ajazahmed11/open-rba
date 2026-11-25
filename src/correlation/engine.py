@@ -224,8 +224,15 @@ def correlate_alerts(
         if not ts_str:
             logger.warning(f"Skipping alert missing timestamp: {alert}")
             continue
-        if "agent_name" not in alert or "rule_id" not in alert:
-            logger.warning(f"Skipping malformed alert missing required keys (agent_name or rule_id): {alert}")
+        agent_val = alert.get("agent_name")
+        rule_val = alert.get("rule_id")
+        if not isinstance(agent_val, str) or not agent_val.strip() or rule_val is None or str(rule_val).strip() == "":
+            logger.warning(f"Skipping malformed alert missing valid agent_name or rule_id: {alert}")
+            continue
+        try:
+            int(alert.get("rule_level", 0))
+        except (ValueError, TypeError):
+            logger.warning(f"Skipping alert with non-numeric rule_level (ID: {alert.get('id')}): {alert.get('rule_level')!r}")
             continue
         try:
             ts = parse_timestamp(ts_str)
